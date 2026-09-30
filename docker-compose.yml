@@ -1,0 +1,12 @@
+services:
+  analyzer:
+    build: .
+    image: xiyue-taste-analyzer
+    command: python -m analyzer loop --music /music --data /data --out /out --workers 2 --interval-hours 24
+    volumes:
+      - "${MUSIC_DIR}:/music:ro"
+      - "./data:/data"
+      - "${OUT_DIR}:/out"
+    cpus: "2.0"
+    mem_limit: 2g
+    restart: unless-stopped

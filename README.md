@@ -1,0 +1,71 @@
+# 汐乐曲库音频特征分析容器
+
+只读扫描音乐目录，将音频特征、标签、歌词语种和每首歌最相近的 20 首写入 `xiyue-taste-v1.json.gz`。不提供 HTTP 服务，不调用外部 API，不修改音乐文件或标签。
+
+## 在飞牛 NAS 部署
+
+1. 在飞牛安装并启动 Docker，将整个 `taste-analyzer` 目录放到 NAS，例如 `/vol1/1000/docker/taste-analyzer`。
+2. 打开飞牛终端或 SSH，进入该目录。把下面的音乐目录和输出目录改成自己的真实绝对路径：
+
+   ```bash
+   cd /vol1/1000/docker/taste-analyzer
+   export MUSIC_DIR='/vol1/1000/Music'
+   export OUT_DIR='/vol1/1000/xiyue-taste'
+   mkdir -p data "$OUT_DIR"
+   docker compose up -d --build
+   ```
+
+3. 在同一个终端查看运行情况：
+
+   ```bash
+   docker compose logs -f analyzer
+   ```
+
+音乐目录挂载到 `/music:ro`；缓存保存在本目录的 `data/cache.sqlite`；输出保存在 `$OUT_DIR/xiyue-taste-v1.json.gz`。容器使用 2 个分析进程，限制为 2 CPU、2 GB 内存。启动后扫描一次，随后每隔 24 小时再扫描。
+
+重新打开终端执行 Compose 命令时，需要先重新设置上述 `MUSIC_DIR` 和 `OUT_DIR`。NAS 上的 Docker 需要有音乐目录的读取权限，以及缓存目录、输出目录的写入权限。
+
+## 手动扫描一次
+
+在已经设置上述两个目录变量的终端中执行：
+
+```bash
+docker compose run --rm analyzer python -m analyzer scan --music /music --data /data --out /out --workers 2
+```
+
+Python 命令行也可以独立运行：
+
+```bash
+python -m analyzer scan --music /music --data /data --out /out --workers 2
+python -m analyzer loop --music /music --data /data --out /out --workers 2 --interval-hours 24
+```
+
+`--workers` 默认 2；`loop` 的 `--interval-hours` 默认 24。
+
+## 数据与增量规则
+
+- 支持扩展名 `flac mp3 m4a aac wav aiff ape ogg opus wma dsf`，不区分大小写，跳过隐藏目录。
+- 路径相对于音乐根目录。路径、大小、修改时间和分析器版本全部不变时，不再提取特征；已删除文件从缓存移除。
+- 单个文件分析失败时，只在缓存 `error` 列记录异常类名，不重试，也不进入输出。文件或分析器版本改变后才重新分析。
+- 每首歌取从总时长 30% 处开始的最多 60 秒；不足 60 秒时读取全曲。提取 53 维特征，再标准化、分组加权和 L2 归一化。
+- 标签缺失为 `null`，标题缺失使用不含扩展名的文件名。歌词优先使用同名 `.lrc`，其次使用内嵌歌词；没有歌词时语种为 `null`。
+- 输出 schema 为 1，时间为 UTC。向量和相似度保留 4 位小数，近邻用输出 `tracks` 数组下标表示，排除自身。
+- 输出先写临时 gzip 文件，再原子替换正式文件。
+
+## 本地验证
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+pytest -q
+docker build -t xiyue-taste-analyzer .
+```
+
+测试仅生成合成音频，不使用真实歌曲。
+
+读取输出曲目数：
+
+```bash
+python3 -c "import gzip,json;d=json.load(gzip.open('out/xiyue-taste-v1.json.gz'));print(len(d['tracks']))"
+```
