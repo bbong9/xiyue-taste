@@ -9,6 +9,7 @@ from .butler import Butler
 from .panel import OutputIndex, PanelState
 from .scan import scan
 from .serve import make_server
+from .settings import LLMSettings
 
 
 def main():
@@ -48,8 +49,11 @@ def main():
         model = os.environ.get("TASTE_LLM_MODEL", "deepseek-ai/DeepSeek-V3.2")
         asker = Asker(index, api_key, base_url, model)
         butler = Butler(api_key, base_url, model)
+        llm = LLMSettings(
+            os.path.join(args.data, "llm-settings.json"), api_key, base_url, model, targets=(asker, butler),
+        )
         server = make_server(
-            args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler,
+            args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler, llm=llm,
             access_token=access_token, trusted_network=trusted_network, host_ip=host_ip,
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()

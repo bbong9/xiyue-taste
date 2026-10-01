@@ -103,6 +103,8 @@
     }
     .scan:hover:not(:disabled) { box-shadow: 0 0 24px var(--moon-soft); background: color-mix(in srgb, var(--moon) 18%, transparent); }
     .scan:disabled { opacity: .5; cursor: default; }
+    .scan.quiet { border-color: var(--line); background: var(--panel); color: var(--muted); }
+    .scan.quiet:hover:not(:disabled) { box-shadow: none; background: var(--panel); color: inherit; border-color: color-mix(in srgb, var(--tide) 50%, transparent); }
 
     .hero { padding: 72px 0 56px; }
     .eyebrow { margin: 0 0 14px; color: var(--muted); font-size: 13px; letter-spacing: .4em; }
@@ -255,6 +257,20 @@
     .metric + .metric { padding-left: 18px; border-left: 1px solid var(--line); }
     .metric-value { font: 600 24px/1.2 var(--serif); font-variant-numeric: tabular-nums; }
     .metric-label { color: var(--muted); font-size: 12px; letter-spacing: .2em; }
+    .field { display: block; margin-top: 20px; }
+    .field span { display: block; margin-bottom: 8px; color: var(--muted); font-size: 12px; letter-spacing: .2em; }
+    .field input {
+      width: 100%; height: 42px; padding: 0 14px; border-radius: 12px; outline: none;
+      border: 1px solid var(--line); background: var(--panel); font-size: 14px;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    .field input::placeholder { color: var(--faint); }
+    .field input:focus { border-color: color-mix(in srgb, var(--tide) 60%, transparent); box-shadow: 0 0 0 4px var(--tide-soft); }
+    .ai-actions { display: flex; gap: 12px; margin-top: 26px; }
+    .ai-result { white-space: pre-line; margin: 18px 0 0; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); font-size: 13px; line-height: 1.6; word-break: break-word; }
+    .ai-result.good { color: var(--sea); border-color: color-mix(in srgb, var(--sea) 40%, transparent); }
+    .ai-result.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+    .ai-note { margin: 22px 0 0; color: var(--faint); font-size: 12px; line-height: 1.7; }
     .drawer h3 { margin: 28px 0 8px; font: 600 16px var(--serif); letter-spacing: .2em; }
     .drawer h3 small { font: 12px var(--sans); color: var(--muted); letter-spacing: 0; margin-left: 8px; }
     .near-list { list-style: none; margin: 0 -12px; padding: 0; }
@@ -320,6 +336,7 @@
       </div>
       <div class="actions">
         <span class="status" id="status"><i></i><span id="status-text">连接中</span></span>
+        <button class="scan quiet" id="ai-open" type="button">AI 设置</button>
         <button class="scan" id="scan" type="button">立即扫描</button>
       </div>
     </header>
@@ -396,6 +413,29 @@
     <h3>听感相近<small id="d-near-count"></small></h3>
     <ol class="near-list" id="d-near"></ol>
     <p class="d-path" id="d-path"></p>
+  </aside>
+  <aside class="drawer" id="ai-drawer" role="dialog" aria-modal="true" aria-labelledby="ai-title" aria-hidden="true">
+    <button class="close" id="ai-close" type="button" aria-label="关闭"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m3.5 3.5 9 9m0-9-9 9" stroke-linecap="round"/></svg></button>
+    <p class="eyebrow">说一句找歌</p>
+    <h2 class="d-title" id="ai-title">AI 设置</h2>
+    <p class="d-sub" id="ai-state">正在读取…</p>
+    <form id="ai-form">
+      <label class="field"><span>接口地址</span>
+        <input id="ai-base" type="url" placeholder="https://api.siliconflow.cn/v1" autocomplete="off" spellcheck="false" required>
+      </label>
+      <label class="field"><span>模型</span>
+        <input id="ai-model" type="text" placeholder="deepseek-ai/DeepSeek-V3" autocomplete="off" spellcheck="false" required>
+      </label>
+      <label class="field"><span>密钥</span>
+        <input id="ai-key" type="password" placeholder="留空则不修改" autocomplete="new-password" spellcheck="false">
+      </label>
+      <div class="ai-actions">
+        <button class="scan" id="ai-test" type="submit">保存并测试</button>
+        <button class="scan quiet" id="ai-save" type="button">只保存</button>
+      </div>
+    </form>
+    <p class="ai-result" id="ai-result" role="status" hidden></p>
+    <p class="ai-note">密钥只存在这台飞牛上，保存后不会再显示。这里保存的设置优先于 .env 里的。</p>
   </aside>
 
   <script>
@@ -791,11 +831,93 @@
       $("drawer").classList.remove("open");
       $("drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
-      setTimeout(() => { if (!$("drawer").classList.contains("open")) $("scrim").hidden = true; }, 300);
+      setTimeout(() => { if (!$("drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open")) $("scrim").hidden = true; }, 300);
       selected = null;
       highlight();
       previousFocus?.focus({ preventScroll: true });
     }
+
+    let aiFocus = null;
+    function aiResult(text, kind) {
+      $("ai-result").hidden = !text;
+      $("ai-result").className = "ai-result" + (kind ? " " + kind : "");
+      $("ai-result").textContent = text || "";
+    }
+    function aiState(status) {
+      $("ai-state").textContent = status.configured ? `已配置 · ${status.model}` : "还没填密钥";
+    }
+    async function openAI() {
+      if ($("drawer").classList.contains("open")) closeDetail();
+      aiFocus = document.activeElement;
+      aiResult("");
+      $("ai-key").value = "";
+      $("scrim").hidden = false;
+      requestAnimationFrame(() => $("scrim").classList.add("show"));
+      $("ai-drawer").classList.add("open");
+      $("ai-drawer").setAttribute("aria-hidden", "false");
+      try {
+        const status = await api("/api/llm");
+        $("ai-base").value = status.baseURL;
+        $("ai-model").value = status.model;
+        aiState(status);
+      } catch (error) {
+        $("ai-state").textContent = error.message === "404" ? "这个版本的容器还不支持在这里设置" : "读不到设置";
+      }
+    }
+    function closeAI() {
+      $("ai-drawer").classList.remove("open");
+      $("ai-drawer").setAttribute("aria-hidden", "true");
+      $("scrim").classList.remove("show");
+      setTimeout(() => {
+        if (!$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open")) $("scrim").hidden = true;
+      }, 300);
+      aiFocus?.focus({ preventScroll: true });
+    }
+    async function saveAI() {
+      const body = { baseURL: $("ai-base").value.trim(), model: $("ai-model").value.trim() };
+      if ($("ai-key").value.trim()) body.apiKey = $("ai-key").value.trim();
+      const status = await api("/api/llm", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      $("ai-key").value = "";
+      aiState(status);
+    }
+    async function submitAI(test) {
+      if (!$("ai-form").reportValidity()) return;
+      $("ai-test").disabled = $("ai-save").disabled = true;
+      aiResult(test ? "正在保存并测试…" : "正在保存…");
+      try {
+        await saveAI();
+      } catch (error) {
+        aiResult(error.message === "400" ? "地址或模型的格式不对" : error.message === "401" ? "访问口令不对" : "保存失败", "bad");
+        $("ai-test").disabled = $("ai-save").disabled = false;
+        return;
+      }
+      if (!test) {
+        aiResult("已保存", "good");
+      } else {
+        try {
+          const result = await api("/api/llm/test", { method: "POST" });
+          if (result.ok) {
+            aiResult(`连接正常，${(result.ms / 1000).toFixed(1)} 秒回应 · ${result.model}`, "good");
+          } else {
+            const reasons = {
+              unconfigured: "还没填密钥", unreachable: "连不上这个接口地址", bad_answer: "模型有回应，但没按要求的格式回答",
+              http_401: "密钥不对（401）", http_403: "没有权限或余额不足（403）", http_404: "地址或模型名不对（404）", http_429: "请求太频繁或额度用完（429）",
+            };
+            const reason = reasons[result.error] || `模型服务返回 ${result.error.replace("http_", "")}`;
+            aiResult(result.detail ? `${reason}\n${result.detail}` : reason, "bad");
+          }
+        } catch {
+          aiResult("已保存，但测试没有跑通", "bad");
+        }
+      }
+      $("ai-test").disabled = $("ai-save").disabled = false;
+    }
+    $("ai-open").addEventListener("click", openAI);
+    $("ai-close").addEventListener("click", closeAI);
+    $("ai-form").addEventListener("submit", event => { event.preventDefault(); submitAI(true); });
+    $("ai-save").addEventListener("click", () => submitAI(false));
 
     $("access-token-form").addEventListener("submit", async event => {
       event.preventDefault();
@@ -828,8 +950,14 @@
     $("next").addEventListener("click", () => { offset += pageSize; loadTracks().catch(() => offline(true)); });
     $("failures").addEventListener("toggle", () => { if ($("failures").open) loadFailures().catch(() => offline(true)); });
     $("d-close").addEventListener("click", closeDetail);
-    $("scrim").addEventListener("click", closeDetail);
+    $("scrim").addEventListener("click", () => {
+      if ($("ai-drawer").classList.contains("open")) closeAI(); else closeDetail();
+    });
     document.addEventListener("keydown", event => {
+      if ($("ai-drawer").classList.contains("open")) {
+        if (event.key === "Escape") closeAI();
+        return;
+      }
       if (!$("drawer").classList.contains("open")) return;
       if (event.key === "Escape") closeDetail();
       if (event.key === "Tab") {

@@ -27,6 +27,9 @@ class Butler:
         self._timeout = timeout
         self._urlopen = urlopen
 
+    def configure(self, api_key, base_url, model):
+        self._api_key, self._base_url, self._model = api_key, base_url, model
+
     def artists(self, artists):
         if not self._api_key:
             raise AskError("ask_unconfigured", 503)

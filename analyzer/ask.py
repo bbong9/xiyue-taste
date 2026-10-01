@@ -86,6 +86,9 @@ class Asker:
         self._timeout = timeout
         self._urlopen = urlopen
 
+    def configure(self, api_key, base_url, model):
+        self._api_key, self._base_url, self._model = api_key, base_url, model
+
     def status(self):
         return {"configured": bool(self._api_key), "model": self._model}
 

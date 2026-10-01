@@ -818,3 +818,84 @@ def test_ask_http_part(tmp_path, body, status, expected_part):
         connection.close()
         server.shutdown()
         server.server_close()
+
+
+class _Configurable:
+    def __init__(self):
+        self.seen = None
+
+    def configure(self, api_key, base_url, model):
+        self.seen = (api_key, base_url, model)
+
+
+def test_llm_settings_save_keeps_the_key_unless_a_new_one_is_given(tmp_path):
+    from analyzer.settings import LLMSettings, SettingsError
+
+    path = tmp_path / "llm-settings.json"
+    target = _Configurable()
+    settings = LLMSettings(path, "env-key", "https://env.example/v1", "env-model", targets=(target,))
+    assert target.seen == ("env-key", "https://env.example/v1", "env-model")
+
+    settings.update("https://new.example/v1/", "new-model")
+    assert target.seen == ("env-key", "https://new.example/v1", "new-model")
+    settings.update("https://new.example/v1", "new-model", "panel-key")
+    assert target.seen[0] == "panel-key"
+    assert settings.status() == {"configured": True, "baseURL": "https://new.example/v1", "model": "new-model"}
+    assert path.stat().st_mode & 0o777 == 0o600
+
+    again = _Configurable()
+    LLMSettings(path, "env-key", "https://env.example/v1", "env-model", targets=(again,))
+    assert again.seen == ("panel-key", "https://new.example/v1", "new-model")
+
+    for base_url, model, key in [("ftp://x", "m", None), ("https://x", "", None), ("https://x", "m", "a b")]:
+        with pytest.raises(SettingsError):
+            settings.update(base_url, model, key)
+
+
+def test_llm_settings_test_reports_the_answer_and_hides_the_key(tmp_path):
+    from analyzer.settings import LLMSettings
+
+    urlopen, calls = _fake_llm('{"ok": true}')
+    settings = LLMSettings(tmp_path / "s.json", "secret-key", "https://example.com/v1", "m", urlopen=urlopen)
+    result = settings.test()
+    assert result["ok"] is True and result["model"] == "m" and len(calls) == 1
+
+    def refuse(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 401, "no", {}, io.BytesIO(b'{"message":"bad secret-key"}'))
+
+    refused = LLMSettings(tmp_path / "s.json", "secret-key", "https://example.com/v1", "m", urlopen=refuse).test()
+    assert refused["ok"] is False and refused["error"] == "http_401"
+    assert "secret-key" not in refused["detail"]
+    assert LLMSettings(tmp_path / "t.json", "", "https://example.com/v1", "m").test()["error"] == "unconfigured"
+
+
+def test_llm_http_reads_saves_and_never_returns_the_key(tmp_path):
+    from analyzer.settings import LLMSettings
+
+    urlopen, _ = _fake_llm('{"picks":[]}')
+    asker = Asker(_AskIndex(), "", "https://example.com/v1", "old-model", urlopen=urlopen)
+    llm = LLMSettings(tmp_path / "llm-settings.json", "", "https://example.com/v1", "old-model", targets=(asker,))
+    server = make_server(tmp_path, 0, data=tmp_path, state=PanelState(), index=_AskIndex(), asker=asker, llm=llm)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        def post(body):
+            request = urllib.request.Request(
+                base + "/api/llm", data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            return urllib.request.urlopen(request)
+
+        with post({"baseURL": "https://example.com/v1", "model": "new-model", "apiKey": "panel-key"}) as response:
+            body = response.read()
+            assert b"panel-key" not in body
+            assert json.loads(body) == {"configured": True, "baseURL": "https://example.com/v1", "model": "new-model"}
+        with urllib.request.urlopen(base + "/api/llm") as response:
+            assert b"panel-key" not in response.read()
+        assert asker.status() == {"configured": True, "model": "new-model"}
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            post({"baseURL": "nope", "model": "m"})
+        assert failure.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
