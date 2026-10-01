@@ -114,6 +114,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     self._send_json(track)
             elif url.path == "/api/failures":
                 self._send_json(self._index.failures(self._data))
+            elif url.path == "/api/ask/status":
+                self._send_json(
+                    self._asker.status() if self._asker is not None else {"configured": False, "model": ""}
+                )
             else:
                 self._send_json({"error": "not_found"}, 404)
         else:
@@ -136,8 +140,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 if not isinstance(q, str) or not q.strip() or len(q.strip()) > 100:
                     self._send_json({"error": "bad_query"}, 400)
                     return
+                taste = body.get("taste", [])
+                if not isinstance(taste, list) or len(taste) > 20 or not all(
+                    isinstance(name, str) and 1 <= len(name) <= 40 for name in taste
+                ):
+                    self._send_json({"error": "bad_query"}, 400)
+                    return
                 try:
-                    self._send_json(self._asker.ask(q.strip()))
+                    self._send_json(self._asker.ask(q.strip(), taste))
                 except AskError as error:
                     self._send_json({"error": error.code}, error.status)
             elif path in ("/api/butler/artists", "/api/butler/songs") and self._panel_available():

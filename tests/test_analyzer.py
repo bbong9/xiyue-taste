@@ -372,6 +372,8 @@ def test_ask_selects_valid_unique_indices_and_sends_catalog():
     result = asker.ask("下雨天安静一点的")
     assert result == {
         "reason": "安静",
+        "songs": [],
+        "playlists": [],
         "items": [
             {"index": 2, "title": "第三首", "artists": ["歌手"], "path": "third.wav"},
             {"index": 0, "title": "First", "artists": ["A", "B"], "path": "first.wav"},
@@ -387,7 +389,7 @@ def test_ask_selects_valid_unique_indices_and_sends_catalog():
     body = json.loads(request.data)
     assert body["model"] == "test-model"
     assert body["temperature"] == 0.3
-    assert body["max_tokens"] == 400
+    assert body["max_tokens"] == 1200
     content = body["messages"][1]["content"]
     assert "下雨天安静一点的" in content
     assert "2|第三首|歌手|Ambient|zh|60|-25.0" in content
@@ -446,7 +448,7 @@ def test_ask_http_queries(tmp_path, body, configured, ask_error, status, expecte
     queries = []
 
     class FakeAsker:
-        def ask(self, query):
+        def ask(self, query, taste=()):
             queries.append(query)
             if ask_error is not None:
                 raise ask_error
@@ -583,5 +585,75 @@ def test_butler_http_limits_and_results(tmp_path, kind, count, configured, statu
         assert calls == ([items] if status == 200 else [])
     finally:
         connection.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_ask_platform_recommendations_filter_and_deduplicate():
+    urlopen, _ = _fake_llm(json.dumps({
+        "reason": "r", "picks": [0],
+        "songs": [{"title": " 晴天 ", "artist": "周杰伦"}, {"title": "晴天", "artist": "周杰伦"},
+                  {"title": "", "artist": "x"}, "bad", {"title": "稻香", "artist": "周杰伦"}],
+        "playlists": ["雨天 华语", "雨天 华语", "", "一二三四五六七八九十一二三四五六七八九十一"],
+    }))
+    result = Asker(_AskIndex(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen).ask("q")
+    assert result["songs"] == [{"title": "晴天", "artist": "周杰伦"}, {"title": "稻香", "artist": "周杰伦"}]
+    assert result["playlists"] == ["雨天 华语"]
+
+
+def test_ask_old_model_content_keeps_library_and_empty_platform_fields():
+    urlopen, _ = _fake_llm('{"reason":"r","picks":[0]}')
+    result = Asker(_AskIndex(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen).ask("q")
+    assert result["songs"] == []
+    assert result["playlists"] == []
+    assert [item["index"] for item in result["items"]] == [0]
+
+
+def test_ask_includes_taste_only_when_given():
+    urlopen, calls = _fake_llm('{"picks":[]}')
+    asker = Asker(_AskIndex(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen)
+    asker.ask("q", ["陈奕迅", "林俊杰"])
+    asker.ask("q")
+    first, second = [json.loads(request.data) for request, _ in calls]
+    assert "常听歌手：陈奕迅、林俊杰\n要求：q" in first["messages"][1]["content"]
+    assert "常听歌手" not in second["messages"][1]["content"]
+    assert first["max_tokens"] == 1200
+
+
+@pytest.mark.parametrize("taste", [["A"] * 21, "A", [""], ["A" * 41], [1]])
+def test_ask_http_rejects_invalid_taste(tmp_path, taste):
+    urlopen, calls = _fake_llm('{"picks":[]}')
+    asker = Asker(_AskIndex(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen)
+    server = make_server(tmp_path, 0, data=tmp_path, state=PanelState(), index=_AskIndex(), asker=asker)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+    try:
+        connection.request("POST", "/api/ask", json.dumps({"q": "q", "taste": taste}).encode("utf-8"),
+                           {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        assert response.status == 400
+        assert json.loads(response.read()) == {"error": "bad_query"}
+        assert calls == []
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_ask_http_status_does_not_expose_key_or_call_model(tmp_path, configured):
+    urlopen, calls = _fake_llm('{"picks":[]}')
+    asker = Asker(_AskIndex(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen)
+    server = make_server(tmp_path, 0, data=tmp_path, state=PanelState(), index=_AskIndex(),
+                         asker=asker if configured else None)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{server.server_address[1]}/api/ask/status") as response:
+            body = response.read()
+            assert response.status == 200
+            assert b"test-key" not in body
+            assert json.loads(body) == {"configured": configured, "model": "test-model" if configured else ""}
+        assert calls == []
+    finally:
         server.shutdown()
         server.server_close()
