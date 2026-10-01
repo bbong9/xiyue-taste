@@ -55,12 +55,11 @@ python -m analyzer loop --music /music --data /data --out /out --workers 2 --int
 ## 本地验证
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-pytest -q
 docker build -t xiyue-taste-analyzer .
+docker run --rm -v "$PWD/tests:/app/tests:ro" xiyue-taste-analyzer python -m pytest -q -p no:cacheprovider tests
 ```
+
+解码依赖 ffmpeg，测试在镜像里跑。
 
 测试仅生成合成音频，不使用真实歌曲。
 

@@ -27,7 +27,10 @@ def lyrics_language(lyrics):
 
 def _values(metadata, *keys):
     for key in keys:
-        value = metadata.get(key)
+        try:
+            value = metadata.get(key)
+        except ValueError:
+            continue
         if value is None:
             continue
         value = getattr(value, "text", value)

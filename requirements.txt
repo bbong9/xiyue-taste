@@ -1,6 +1,6 @@
-librosa
-numpy
-soundfile
-mutagen
-pyloudnorm
-pytest
+librosa==1.0.0
+numpy==2.5.3
+soundfile==0.14.0
+mutagen==1.48.1
+pyloudnorm==0.2.0
+pytest==9.1.1

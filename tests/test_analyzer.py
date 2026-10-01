@@ -2,10 +2,12 @@ import gzip
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
+import mutagen.flac
 import numpy as np
 import soundfile as sf
 
@@ -145,3 +147,26 @@ def test_similar_sine_tracks_are_mutual_nearest_neighbors(tmp_path):
     assert [index for index, _ in neighbors[1]] == [0, 2]
     assert neighbors[0][0][1] > neighbors[0][1][1]
     assert neighbors[1][0][1] > neighbors[1][1][1]
+
+
+def test_flac_without_genre_or_year_reads_tags(tmp_path):
+    path = tmp_path / "song.flac"
+    sf.write(path, np.zeros(SAMPLE_RATE), SAMPLE_RATE, subtype="PCM_16")
+    flac = mutagen.flac.FLAC(path)
+    flac["title"] = "Only Title"
+    flac["artist"] = "Someone"
+    flac.save()
+    tags = read_tags(path)
+    assert tags["title"] == "Only Title"
+    assert tags["artists"] == ["Someone"]
+    assert tags["genre"] is None
+    assert tags["year"] is None
+
+
+def test_m4a_decodes_through_ffmpeg(tmp_path):
+    wav, m4a = tmp_path / "song.wav", tmp_path / "song.m4a"
+    write_sine(wav, seconds=6)
+    subprocess.run(["ffmpeg", "-v", "error", "-i", wav, "-c:a", "aac", m4a], check=True)
+    features = extract_features(m4a)
+    assert len(features["vector"]) == 53
+    assert 5.5 <= features["durationSec"] <= 6.5
