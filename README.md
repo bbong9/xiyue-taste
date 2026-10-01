@@ -63,6 +63,8 @@ python -m analyzer run --music /music --data /data --out /out --workers 2 --inte
 
 `POST /api/ask` 接收 JSON `{"q":"下雨天安静一点的"}`，去掉首尾空白后限 1～100 字。返回 `reason` 和最多 20 个 `items`，每项包含分析结果里的 `index`、`title`、`artists`、`path`。
 
+`POST /api/ask` 可带 `"part": "library"`（只挑曲库）或 `"online"`（只推荐平台歌和歌单词，不发曲库），不带时和以前一样。
+
 Compose 从同目录的 `.env` 读取以下环境变量并传给容器：
 
 - `TASTE_LLM_API_KEY`：硅基流动密钥，只放在 `.env`，不要写入代码、日志或提交到 Git；不填时接口返回 503。

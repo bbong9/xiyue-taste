@@ -448,7 +448,7 @@ def test_ask_http_queries(tmp_path, body, configured, ask_error, status, expecte
     queries = []
 
     class FakeAsker:
-        def ask(self, query, taste=()):
+        def ask(self, query, taste=(), part="all"):
             queries.append(query)
             if ask_error is not None:
                 raise ask_error
@@ -734,6 +734,86 @@ def test_access_http_requires_token_outside_trusted_network(
         elif path == "/api/scan":
             assert json.loads(body) == {"ok": True}
             assert state.scanRequested.is_set()
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_ask_library_part_sends_catalog_and_small_budget():
+    from analyzer.ask import LIBRARY_PROMPT
+
+    urlopen, calls = _fake_llm(json.dumps({
+        "reason": "r", "picks": [2, 0, 2, -1],
+        "songs": [{"title": "ignored", "artist": "A"}], "playlists": ["ignored"],
+    }))
+    result = Asker(_AskIndex(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen).ask(
+        "q", ["A"], part="library"
+    )
+    body = json.loads(calls[0][0].data)
+    assert body["messages"][0]["content"] == LIBRARY_PROMPT
+    assert body["max_tokens"] == 300
+    assert "曲库（编号" in body["messages"][1]["content"]
+    assert "常听歌手：A\n要求：q" in body["messages"][1]["content"]
+    assert result == {
+        "reason": "r", "songs": [], "playlists": [],
+        "items": [
+            {"index": 2, "title": "第三首", "artists": ["歌手"], "path": "third.wav"},
+            {"index": 0, "title": "First", "artists": ["A", "B"], "path": "first.wav"},
+        ],
+    }
+
+
+def test_ask_online_part_skips_catalog():
+    from analyzer.ask import ONLINE_PROMPT
+
+    class NoCatalog:
+        def load(self):
+            raise AssertionError("Online requests must not load the catalog")
+
+    songs = [{"title": f"song{i}", "artist": "A"} for i in range(12)]
+    urlopen, calls = _fake_llm(json.dumps({"songs": songs, "playlists": ["雨天"]}))
+    result = Asker(NoCatalog(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen).ask(
+        "q", ["A"], part="online"
+    )
+    body = json.loads(calls[0][0].data)
+    assert body["messages"][0]["content"] == ONLINE_PROMPT
+    assert "来自常听歌手的歌最多 3 首" in body["messages"][0]["content"]
+    assert body["max_tokens"] == 700
+    assert "曲库" not in body["messages"][1]["content"]
+    assert body["messages"][1]["content"] == "常听歌手：A\n要求：q"
+    assert result == {"reason": "", "songs": songs[:10], "playlists": ["雨天"], "items": []}
+
+
+@pytest.mark.parametrize(("body", "status", "expected_part"), [
+    ({"q": "q", "part": "bogus"}, 400, None),
+    ({"q": "q", "part": "online"}, 200, "online"),
+    ({"q": "q"}, 200, "all"),
+])
+def test_ask_http_part(tmp_path, body, status, expected_part):
+    parts = []
+
+    class FakeAsker:
+        def ask(self, query, taste=(), part="all"):
+            parts.append(part)
+            return {"reason": "", "songs": [], "playlists": [], "items": []}
+
+    server = make_server(
+        tmp_path, 0, data=tmp_path, state=PanelState(), index=_AskIndex(), asker=FakeAsker()
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+    try:
+        connection.request("POST", "/api/ask", json.dumps(body).encode("utf-8"),
+                           {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        assert response.status == status
+        result = json.loads(response.read())
+        if status == 400:
+            assert result == {"error": "bad_query"}
+            assert parts == []
+        else:
+            assert parts == [expected_part]
     finally:
         connection.close()
         server.shutdown()

@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .ask import AskError
+from .ask import ASK_PARTS, AskError
 
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
@@ -182,8 +182,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 ):
                     self._send_json({"error": "bad_query"}, 400)
                     return
+                part = body.get("part", "all")
+                if part not in ASK_PARTS:
+                    self._send_json({"error": "bad_query"}, 400)
+                    return
                 try:
-                    self._send_json(self._asker.ask(q.strip(), taste))
+                    self._send_json(self._asker.ask(q.strip(), taste, part))
                 except AskError as error:
                     self._send_json({"error": error.code}, error.status)
             elif path in ("/api/butler/artists", "/api/butler/songs") and self._panel_available():
