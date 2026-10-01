@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 import sqlite3
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -22,7 +23,7 @@ def _analyze(path):
     return extract_features(path), read_tags(path)
 
 
-def scan(music, data, out, workers=2):
+def scan(music, data, out, workers=2, progress=None):
     music = Path(music)
     data = Path(data)
     data.mkdir(parents=True, exist_ok=True)
@@ -57,7 +58,12 @@ def scan(music, data, out, workers=2):
 
         for removed in cached.keys() - paths:
             connection.execute("DELETE FROM tracks WHERE path = ?", (removed,))
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        if progress is not None:
+            progress(0, len(pending))
+        done = 0
+        with ProcessPoolExecutor(
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+        ) as executor:
             futures = {
                 executor.submit(_analyze, str(path)): (relative, size, mtime)
                 for path, relative, size, mtime in pending
@@ -81,6 +87,9 @@ def scan(music, data, out, workers=2):
                     (relative, size, mtime, ANALYZER_VERSION, features_json, tags_json, error),
                 )
                 connection.commit()
+                done += 1
+                if progress is not None:
+                    progress(done, len(pending))
         connection.commit()
         tracks = [
             {

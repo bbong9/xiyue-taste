@@ -4,11 +4,15 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import mutagen.flac
 import numpy as np
+import pytest
 import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,6 +21,7 @@ from analyzer import ANALYZER_VERSION
 from analyzer.features import extract_features
 from analyzer.output import write_output
 from analyzer.scan import scan
+from analyzer.serve import make_server
 from analyzer.similarity import build_similarity
 from analyzer.tags import lyrics_language, read_tags
 
@@ -170,3 +175,153 @@ def test_m4a_decodes_through_ffmpeg(tmp_path):
     features = extract_features(m4a)
     assert len(features["vector"]) == 53
     assert 5.5 <= features["durationSec"] <= 6.5
+
+
+def test_serve_sends_gzip_json_and_honours_if_modified_since(tmp_path):
+    payload = b'{"schema":1,"tracks":[]}'
+    (tmp_path / "xiyue-taste-v1.json.gz").write_bytes(gzip.compress(payload))
+    server = make_server(tmp_path, 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/xiyue-taste-v1.json.gz"
+        with urllib.request.urlopen(url) as response:
+            assert response.headers["Content-Encoding"] == "gzip"
+            assert response.headers["Content-Type"] == "application/json"
+            assert gzip.decompress(response.read()) == payload
+            modified = response.headers["Last-Modified"]
+        with pytest.raises(urllib.error.HTTPError) as unchanged:
+            urllib.request.urlopen(urllib.request.Request(url, headers={"If-Modified-Since": modified}))
+        assert unchanged.value.code == 304
+        with pytest.raises(urllib.error.HTTPError) as missing:
+            urllib.request.urlopen(url.replace("v1", "v0"))
+        assert missing.value.code == 404
+        assert missing.value.headers["Content-Encoding"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+from analyzer.panel import OutputIndex, PanelState
+
+
+def _write_panel_output(out, count=3):
+    tracks = [
+        {
+            "path": f"song-{index}.wav", "size": 1, "mtime": 1,
+            "features": {
+                "vector": [float(index)] * 53, "durationSec": 6,
+                "bpm": (50, 120, 190)[index % 3],
+                "loudnessLUFS": (-30, -15, 0)[index % 3],
+            },
+            "tags": {
+                "title": f"Moonlight {index}", "artists": ["Artist"],
+                "album": "Album", "genre": "Ambient", "year": "2026",
+                "lyricsLanguage": ("zh", None, "en")[index % 3],
+            },
+        }
+        for index in range(count)
+    ]
+    vectors, neighbors = build_similarity(tracks)
+    write_output(out, tracks, vectors, neighbors)
+    return tracks
+
+
+def test_panel_state_progress_finish_and_failure():
+    state = PanelState()
+    state.begin_scan()
+    state.set_progress(3, 10)
+    snapshot = state.snapshot()
+    assert snapshot["state"] == "scanning"
+    assert (snapshot["done"], snapshot["total"]) == (3, 10)
+    snapshot["done"] = 99
+    assert state.snapshot()["done"] == 3
+    state.finish_scan(5, 120)
+    snapshot = state.snapshot()
+    assert snapshot["state"] == "idle"
+    assert snapshot["lastAnalyzed"] == 5
+    assert snapshot["lastExported"] == 120
+    state.fail_scan(ValueError())
+    assert state.snapshot()["error"] == "ValueError"
+    state.request_scan()
+    state.wait_for_next(0)
+    assert not state.scanRequested.is_set()
+
+
+def test_output_index_stats_histograms_and_languages(tmp_path):
+    index = OutputIndex(tmp_path)
+    assert index.stats()["trackCount"] == 0
+    assert index.stats()["bpm"] == {"min": None, "max": None, "bins": []}
+    tracks = _write_panel_output(tmp_path)
+    stats = index.stats()
+    assert stats["trackCount"] == 3
+    assert len(stats["bpm"]["bins"]) == 12
+    assert sum(bucket["count"] for bucket in stats["bpm"]["bins"]) == 3
+    assert stats["bpm"]["bins"][0]["count"] == 1
+    assert stats["bpm"]["bins"][-1]["count"] == 1
+    assert len(stats["loudness"]["bins"]) == 10
+    assert sum(bucket["count"] for bucket in stats["loudness"]["bins"]) == 3
+    assert sum(item["count"] for item in stats["languages"]) == sum(
+        bool(track["tags"]["lyricsLanguage"]) for track in tracks
+    )
+    assert all("vector" not in track for track in index.load())
+
+
+def test_output_index_search_limit_and_neighbor_details(tmp_path):
+    _write_panel_output(tmp_path)
+    index = OutputIndex(tmp_path)
+    matches = index.tracks("MOONLIGHT 1", 0, 50)
+    assert matches["total"] == 1
+    assert matches["items"][0]["index"] == 1
+    neighbor = index.track(0)["neighbors"][0]
+    assert "title" in neighbor and "score" in neighbor
+    assert index.track(99) is None
+    _write_panel_output(tmp_path, count=105)
+    assert len(index.tracks("", 0, 1000)["items"]) == 100
+
+
+def test_panel_http_routes_and_scan_request(tmp_path):
+    _write_panel_output(tmp_path)
+    state = PanelState()
+    server = make_server(
+        tmp_path, 0, data=tmp_path / "data", state=state, index=OutputIndex(tmp_path)
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(base + "/") as response:
+            assert response.status == 200
+            assert response.headers["Content-Type"].startswith("text/html")
+            assert response.headers["Cache-Control"] == "no-cache"
+        with urllib.request.urlopen(base + "/api/status") as response:
+            assert "state" in json.load(response)
+            assert response.headers["Content-Type"] == "application/json; charset=utf-8"
+            assert response.headers["Cache-Control"] == "no-store"
+        request = urllib.request.Request(base + "/api/scan", data=b"", method="POST")
+        with urllib.request.urlopen(request) as response:
+            assert json.load(response) == {"ok": True}
+        assert state.scanRequested.is_set()
+        with pytest.raises(urllib.error.HTTPError) as missing:
+            urllib.request.urlopen(base + "/api/track?i=99")
+        assert missing.value.code == 404
+        assert json.load(missing.value) == {"error": "not_found"}
+        with urllib.request.urlopen(base + "/xiyue-taste-v1.json.gz") as response:
+            assert response.headers["Content-Encoding"] == "gzip"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_scan_reports_initial_and_completed_progress(tmp_path):
+    music = tmp_path / "music"
+    music.mkdir()
+    for index in range(2):
+        write_sine(music / f"song-{index}.wav")
+    updates = []
+    result = scan(
+        music, tmp_path / "data", tmp_path / "out", workers=2,
+        progress=lambda done, total: updates.append((done, total)),
+    )
+    assert result == {"analyzed": 2, "tracks": 2}
+    assert updates[0] == (0, 2)
+    assert updates[-1] == (2, 2)
+    assert updates == [(0, 2), (1, 2), (2, 2)]

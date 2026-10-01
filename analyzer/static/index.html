@@ -1,0 +1,824 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>汐乐 · 懂你</title>
+  <style>
+    :root {
+      --night: #05080f;
+      --night-2: #0a1020;
+      --panel: rgba(255, 255, 255, .028);
+      --panel-hi: rgba(255, 255, 255, .055);
+      --line: rgba(255, 255, 255, .075);
+      --text: #edf0f7;
+      --muted: #8d95ad;
+      --faint: #555e7a;
+      --moon: #f4d9a0;
+      --moon-soft: rgba(244, 217, 160, .14);
+      --tide: #8ab8ff;
+      --tide-soft: rgba(138, 184, 255, .16);
+      --sea: #63d2c3;
+      --danger: #ff8f8f;
+      --serif: "Songti SC", "STSong", "Noto Serif SC", "Source Han Serif SC", serif;
+      --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      color-scheme: dark;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --night: #f3f1ec;
+        --night-2: #e8ecf4;
+        --panel: rgba(255, 255, 255, .55);
+        --panel-hi: rgba(255, 255, 255, .9);
+        --line: rgba(24, 32, 60, .09);
+        --text: #161b2c;
+        --muted: #5d6680;
+        --faint: #a0a7bb;
+        --moon: #a87a26;
+        --moon-soft: rgba(168, 122, 38, .12);
+        --tide: #3567d0;
+        --tide-soft: rgba(53, 103, 208, .12);
+        --sea: #188f80;
+        --danger: #c53d3d;
+        color-scheme: light;
+      }
+      #sky { display: none; }
+    }
+
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font: 15px/1.6 var(--sans);
+      background:
+        radial-gradient(1100px 700px at 88% -12%, var(--moon-soft), transparent 62%),
+        radial-gradient(900px 600px at -10% 110%, var(--tide-soft), transparent 60%),
+        linear-gradient(180deg, var(--night), var(--night-2));
+      background-attachment: fixed;
+      overflow-x: hidden;
+    }
+    button, input { font: inherit; color: inherit; }
+    button { cursor: pointer; }
+
+    #sky { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }
+    .tide {
+      position: fixed; left: 0; right: 0; bottom: 0; height: 140px;
+      pointer-events: none; z-index: 0; overflow: hidden; opacity: .35;
+      -webkit-mask-image: linear-gradient(transparent, #000 60%); mask-image: linear-gradient(transparent, #000 60%);
+    }
+    .tide svg { position: absolute; bottom: 0; left: 0; width: 200%; height: 100%; }
+    .tide .w1 { fill: var(--tide-soft); animation: drift 38s linear infinite; }
+    .tide .w2 { fill: var(--moon-soft); animation: drift 26s linear infinite reverse; bottom: -12px; }
+    @keyframes drift { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+
+    .page { position: relative; z-index: 1; max-width: 1140px; margin: 0 auto; padding: 0 28px 160px; }
+
+    .top {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      padding: 28px 0 0;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand svg { width: 30px; height: 30px; filter: drop-shadow(0 0 12px var(--moon-soft)); }
+    .brand b { font: 600 20px/1 var(--serif); letter-spacing: .08em; }
+    .brand span { color: var(--muted); font-size: 13px; letter-spacing: .3em; padding-left: 12px; border-left: 1px solid var(--line); }
+    .actions { display: flex; align-items: center; gap: 12px; }
+    .status {
+      display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 14px;
+      border-radius: 999px; background: var(--panel); border: 1px solid var(--line);
+      color: var(--muted); font-size: 13px; white-space: nowrap;
+    }
+    .status i { width: 7px; height: 7px; border-radius: 50%; background: var(--sea); box-shadow: 0 0 10px var(--sea); }
+    .status.scanning i { background: var(--tide); box-shadow: 0 0 10px var(--tide); animation: pulse 1.4s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: .25; } }
+    .scan {
+      height: 34px; padding: 0 18px; border-radius: 999px;
+      border: 1px solid color-mix(in srgb, var(--moon) 55%, transparent);
+      background: linear-gradient(180deg, color-mix(in srgb, var(--moon) 16%, transparent), transparent);
+      color: var(--moon); font-size: 13px; letter-spacing: .06em;
+      transition: background .2s, box-shadow .2s;
+    }
+    .scan:hover:not(:disabled) { box-shadow: 0 0 24px var(--moon-soft); background: color-mix(in srgb, var(--moon) 18%, transparent); }
+    .scan:disabled { opacity: .5; cursor: default; }
+
+    .hero { padding: 72px 0 56px; }
+    .eyebrow { margin: 0 0 14px; color: var(--muted); font-size: 13px; letter-spacing: .4em; }
+    .hero h1 { margin: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 20px; font-weight: 400; }
+    .count {
+      font: 600 clamp(84px, 13vw, 148px)/.9 var(--serif);
+      letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+      background: linear-gradient(170deg, var(--text) 30%, var(--moon));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .unit { font: 400 clamp(20px, 2.6vw, 28px)/1.3 var(--serif); color: var(--muted); letter-spacing: .1em; }
+    .meta { margin: 22px 0 0; display: flex; flex-wrap: wrap; gap: 6px 22px; color: var(--muted); font-size: 14px; }
+    .meta time { color: var(--text); }
+    .progress { margin-top: 26px; height: 2px; max-width: 420px; border-radius: 2px; background: var(--line); overflow: hidden; }
+    .progress div { height: 100%; width: 0; background: linear-gradient(90deg, var(--tide), var(--moon)); box-shadow: 0 0 12px var(--tide); transition: width .6s ease; }
+    .error { margin: 16px 0 0; color: var(--danger); font-size: 14px; }
+
+    .card {
+      position: relative; margin-top: 28px; padding: 30px 32px;
+      border-radius: 22px; background: var(--panel); border: 1px solid var(--line);
+      backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    }
+    .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 18px; }
+    .head h2 { margin: 0; font: 600 22px/1.3 var(--serif); letter-spacing: .12em; }
+    .head p { margin: 6px 0 0; color: var(--muted); font-size: 13px; max-width: 560px; }
+    .legend { display: flex; gap: 18px; color: var(--muted); font-size: 12px; }
+    .legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .legend i { width: 8px; height: 8px; border-radius: 50%; }
+
+    .map-wrap { position: relative; margin: 0 -8px; }
+    #map { display: block; overflow: visible; }
+    #map .grid line { stroke: var(--line); stroke-width: 1; }
+    #map .grid text, #map .axis { fill: var(--faint); font: 11px var(--sans); }
+    #map .axis { fill: var(--muted); letter-spacing: .1em; }
+    #map .bars-bpm rect { fill: var(--tide); opacity: .55; }
+    #map .bars-loud rect { fill: var(--moon); opacity: .55; }
+    #map .star {
+      fill: var(--text); stroke: transparent; stroke-width: 12; cursor: pointer;
+      transition: opacity .35s, fill .35s;
+    }
+    #map .star:hover { fill: var(--moon); }
+    #map.focused .star { opacity: .14 !important; }
+    #map.focused .star.near { opacity: 1 !important; fill: var(--tide); }
+    #map.focused .star.chosen { opacity: 1 !important; fill: var(--moon); }
+    #map .link { stroke: var(--tide); stroke-width: 1; }
+    #map .halo { fill: none; stroke: var(--moon); stroke-width: 1; opacity: .7; transform-box: fill-box; transform-origin: center; animation: halo 2.4s ease-out infinite; }
+    @keyframes halo { from { transform: scale(.4); opacity: .9; } to { transform: scale(1.6); opacity: 0; } }
+    .tip {
+      position: absolute; z-index: 3; pointer-events: none; transform: translate(-50%, calc(-100% - 14px));
+      padding: 10px 14px; border-radius: 12px; min-width: 160px; max-width: 280px;
+      background: color-mix(in srgb, var(--night-2) 92%, transparent); border: 1px solid var(--line);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, .35); font-size: 13px; line-height: 1.45;
+    }
+    .tip b { display: block; font-weight: 600; }
+    .tip span { display: block; color: var(--muted); font-size: 12px; }
+    .tip em { display: block; margin-top: 4px; color: var(--tide); font: 11px var(--mono); font-style: normal; }
+    .placeholder { padding: 48px 0; text-align: center; color: var(--muted); font-size: 14px; }
+
+    .ranks { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 40px; }
+    .ranks h3 { margin: 0 0 14px; font: 600 14px var(--sans); letter-spacing: .3em; color: var(--muted); }
+    .ranks ol { list-style: none; margin: 0; padding: 0; }
+    .ranks li { display: grid; grid-template-columns: 30px 1fr; align-items: center; padding: 8px 0; }
+    .rank { font: 500 13px var(--serif); color: var(--faint); font-variant-numeric: tabular-nums; }
+    .ranks li:first-child .rank { color: var(--moon); }
+    .rank-row { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; }
+    .rank-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rank-count { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
+    .rank-bar { height: 2px; margin-top: 6px; background: var(--line); border-radius: 2px; overflow: hidden; }
+    .rank-bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--tide), var(--sea)); border-radius: 2px; }
+    .ranks li:first-child .rank-bar i { background: linear-gradient(90deg, var(--moon), var(--tide)); }
+    .empty { color: var(--faint); font-size: 13px; padding: 8px 0; display: block; }
+
+    .search {
+      position: relative; width: min(320px, 100%);
+    }
+    .search svg { position: absolute; left: 14px; top: 50%; width: 15px; height: 15px; transform: translateY(-50%); stroke: var(--muted); }
+    .search input {
+      width: 100%; height: 40px; padding: 0 16px 0 38px; border-radius: 999px;
+      border: 1px solid var(--line); background: var(--panel); outline: none; font-size: 14px;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    .search input::placeholder { color: var(--faint); }
+    .search input:focus { border-color: color-mix(in srgb, var(--tide) 60%, transparent); box-shadow: 0 0 0 4px var(--tide-soft); }
+    .cols, .track {
+      display: grid; grid-template-columns: 44px minmax(0, 1fr) 72px 150px; align-items: center; gap: 16px;
+    }
+    .cols { padding: 0 14px 10px; color: var(--faint); font-size: 12px; letter-spacing: .15em; border-bottom: 1px solid var(--line); }
+    .cols span:nth-child(3) { text-align: right; }
+    .list { list-style: none; margin: 0; padding: 6px 0 0; }
+    .track {
+      width: 100%; padding: 11px 14px; border: 0; border-radius: 14px; background: transparent; text-align: left;
+      transition: background .15s;
+    }
+    .track:hover, .track:focus-visible { background: var(--panel-hi); outline: none; }
+    .track-no { font: 13px var(--serif); color: var(--faint); font-variant-numeric: tabular-nums; }
+    .track-text, .near-text { min-width: 0; display: flex; flex-direction: column; }
+    .track-title, .near-title { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .track-sub, .near-sub { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .track-bpm { text-align: right; font: 14px var(--mono); color: var(--tide); }
+    .track-loud { display: flex; align-items: center; gap: 10px; }
+    .meter { flex: 1; height: 4px; border-radius: 4px; background: var(--line); overflow: hidden; }
+    .meter i { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, color-mix(in srgb, var(--moon) 40%, transparent), var(--moon)); }
+    .loud-num { width: 40px; text-align: right; font: 12px var(--mono); color: var(--muted); }
+    .pager { display: flex; justify-content: center; align-items: center; gap: 18px; margin-top: 18px; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+    .pager button {
+      width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--line); background: var(--panel);
+      display: grid; place-items: center;
+    }
+    .pager button:disabled { opacity: .3; cursor: default; }
+    .pager svg { width: 14px; height: 14px; stroke: currentColor; }
+
+    details.fail { margin-top: 28px; padding: 18px 24px; border-radius: 18px; border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent); background: var(--panel); }
+    details.fail summary { cursor: pointer; color: var(--danger); font-size: 14px; }
+    details.fail ul { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+    details.fail li { display: grid; gap: 2px; font: 12px var(--mono); color: var(--muted); word-break: break-all; }
+    details.fail li code:first-child { color: var(--text); }
+
+    .foot { margin-top: 48px; text-align: center; color: var(--faint); font-size: 12px; letter-spacing: .05em; }
+    .foot code { font-family: var(--mono); color: var(--muted); }
+
+    .offline {
+      position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: 20;
+      padding: 8px 16px; border-radius: 999px; font-size: 13px;
+      background: color-mix(in srgb, var(--danger) 18%, var(--night-2)); color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+    }
+
+    .scrim { position: fixed; inset: 0; z-index: 10; background: rgba(2, 4, 10, .45); opacity: 0; transition: opacity .3s; }
+    .scrim.show { opacity: 1; }
+    .drawer {
+      position: fixed; top: 0; right: 0; bottom: 0; z-index: 11; width: min(440px, 100%);
+      padding: 28px 30px 40px; overflow-y: auto; overscroll-behavior: contain;
+      background: color-mix(in srgb, var(--night-2) 94%, transparent); border-left: 1px solid var(--line);
+      backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+      transform: translateX(104%); transition: transform .38s cubic-bezier(.2, .8, .2, 1);
+      box-shadow: -30px 0 60px rgba(0, 0, 0, .35);
+    }
+    .drawer.open { transform: none; }
+    .close {
+      float: right; width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--line); background: var(--panel);
+      display: grid; place-items: center;
+    }
+    .close svg { width: 14px; height: 14px; stroke: currentColor; }
+    .drawer .eyebrow { margin-top: 8px; }
+    .d-title { margin: 0; font: 600 30px/1.25 var(--serif); letter-spacing: .02em; word-break: break-word; }
+    .d-sub { margin: 10px 0 0; color: var(--muted); font-size: 14px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .chip { padding: 3px 11px; border-radius: 999px; font-size: 12px; color: var(--muted); border: 1px solid var(--line); }
+    .metrics { display: grid; grid-template-columns: repeat(3, 1fr); margin: 26px 0 8px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .metric { padding: 16px 0; display: flex; flex-direction: column; gap: 2px; }
+    .metric + .metric { padding-left: 18px; border-left: 1px solid var(--line); }
+    .metric-value { font: 600 24px/1.2 var(--serif); font-variant-numeric: tabular-nums; }
+    .metric-label { color: var(--muted); font-size: 12px; letter-spacing: .2em; }
+    .drawer h3 { margin: 28px 0 8px; font: 600 16px var(--serif); letter-spacing: .2em; }
+    .drawer h3 small { font: 12px var(--sans); color: var(--muted); letter-spacing: 0; margin-left: 8px; }
+    .near-list { list-style: none; margin: 0 -12px; padding: 0; }
+    .near {
+      width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) 84px; gap: 14px; align-items: center;
+      padding: 10px 12px; border: 0; border-radius: 12px; background: transparent; text-align: left; transition: background .15s;
+    }
+    .near:hover, .near:focus-visible { background: var(--panel-hi); outline: none; }
+    .near-score { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; font: 12px var(--mono); color: var(--tide); }
+    .near-score .meter { width: 100%; flex: none; height: 3px; }
+    .near-score .meter i { background: linear-gradient(90deg, var(--tide-soft), var(--tide)); }
+    .d-path { margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--line); font: 11.5px/1.6 var(--mono); color: var(--faint); word-break: break-all; }
+
+    @media (max-width: 860px) {
+      .ranks { grid-template-columns: 1fr; gap: 26px; }
+    }
+    @media (max-width: 640px) {
+      .page { padding: 0 16px 140px; }
+      .top { padding-top: 18px; }
+      .brand span { display: none; }
+      .status { padding: 0 11px; }
+      .hero { padding: 48px 0 36px; }
+      .card { padding: 22px 18px; border-radius: 18px; }
+      .legend { display: none; }
+      .cols { display: none; }
+      .track { grid-template-columns: 28px minmax(0, 1fr) 46px; gap: 10px; padding: 10px 8px; }
+      .track-loud { display: none; }
+      .drawer {
+        top: auto; left: 0; width: 100%; max-height: 86vh; border-left: 0; border-top: 1px solid var(--line);
+        border-radius: 22px 22px 0 0; padding: 22px 20px 34px; transform: translateY(104%);
+      }
+      .drawer.open { transform: none; }
+      .d-title { font-size: 25px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .tide svg, #map .halo, .status.scanning i { animation: none; }
+      .drawer, .scrim, #map .star { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="sky" aria-hidden="true"></canvas>
+  <div class="tide" aria-hidden="true">
+    <svg class="w1" viewBox="0 0 2880 140" preserveAspectRatio="none"><path d="M0 70 C240 30 480 30 720 70 S1200 110 1440 70 S1920 30 2160 70 S2640 110 2880 70 V140 H0Z"/></svg>
+    <svg class="w2" viewBox="0 0 2880 140" preserveAspectRatio="none"><path d="M0 90 C180 60 420 60 720 92 S1260 120 1440 90 S1980 60 2160 92 S2700 120 2880 90 V140 H0Z"/></svg>
+  </div>
+  <p class="offline" id="offline" hidden>连不上分析台，正在重试…</p>
+
+  <div class="page">
+    <header class="top">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <defs><linearGradient id="moon-fill" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff3d6"/><stop offset="1" stop-color="#e8bf72"/></linearGradient></defs>
+          <path d="M21.5 4.2A12 12 0 1 0 27.8 20 9.5 9.5 0 0 1 21.5 4.2Z" fill="url(#moon-fill)"/>
+        </svg>
+        <b>汐乐</b><span>懂你分析台</span>
+      </div>
+      <div class="actions">
+        <span class="status" id="status"><i></i><span id="status-text">连接中</span></span>
+        <button class="scan" id="scan" type="button">立即扫描</button>
+      </div>
+    </header>
+
+    <section class="hero">
+      <p class="eyebrow">你的常听</p>
+      <h1><span class="count" id="count">—</span><span class="unit">首歌，已经听懂</span></h1>
+      <p class="meta"><span>上次扫描 <time id="last-scan">—</time></span><span>下次扫描 <time id="next-scan">—</time></span></p>
+      <div class="progress" id="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden><div id="progress-fill"></div></div>
+      <p class="error" id="scan-error" hidden></p>
+    </section>
+
+    <section class="card">
+      <div class="head">
+        <div>
+          <h2>听感星图</h2>
+          <p>每颗星是一首歌：越往右节奏越快，越往上越响亮。点一颗星，看看哪些歌和它听起来相近。</p>
+        </div>
+        <div class="legend">
+          <span><i style="background:var(--moon)"></i>选中的歌</span>
+          <span><i style="background:var(--tide)"></i>听感相近</span>
+        </div>
+      </div>
+      <div class="map-wrap" id="map-wrap">
+        <svg id="map" role="img" aria-label="曲库听感星图"></svg>
+        <div class="tip" id="tip" hidden></div>
+        <p class="placeholder" id="map-empty">正在读取…</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="head"><div><h2>常听的声音</h2></div></div>
+      <div class="ranks">
+        <div><h3>语种</h3><ol id="languages"></ol></div>
+        <div><h3>风格</h3><ol id="genres"></ol></div>
+        <div><h3>歌手</h3><ol id="artists"></ol></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="head">
+        <div><h2>曲目</h2><p id="tracks-total"></p></div>
+        <label class="search">
+          <svg viewBox="0 0 16 16" fill="none" stroke-width="1.6" aria-hidden="true"><circle cx="7" cy="7" r="5"/><path d="m11 11 3.5 3.5" stroke-linecap="round"/></svg>
+          <input id="search" type="search" placeholder="搜歌名、歌手、专辑" autocomplete="off" aria-label="搜索曲目">
+        </label>
+      </div>
+      <div class="cols" aria-hidden="true"><span>#</span><span>歌曲</span><span>BPM</span><span>响度 LUFS</span></div>
+      <ol class="list" id="track-list"></ol>
+      <p class="placeholder" id="tracks-empty">正在读取…</p>
+      <div class="pager" id="pager" hidden>
+        <button id="prev" type="button" aria-label="上一页"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="M10 3 5 8l5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <span id="page"></span>
+        <button id="next" type="button" aria-label="下一页"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m6 3 5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      </div>
+    </section>
+
+    <details class="fail" id="failures" hidden>
+      <summary id="failures-title"></summary>
+      <ul id="failure-list"></ul>
+    </details>
+
+    <p class="foot">汐乐 App 从 <code>/xiyue-taste-v1.json.gz</code> 读取这些结果</p>
+  </div>
+
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="d-title" aria-hidden="true">
+    <button class="close" id="d-close" type="button" aria-label="关闭"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m3.5 3.5 9 9m0-9-9 9" stroke-linecap="round"/></svg></button>
+    <p class="eyebrow">这首歌</p>
+    <h2 class="d-title" id="d-title"></h2>
+    <p class="d-sub" id="d-sub"></p>
+    <div class="chips" id="d-chips"></div>
+    <div class="metrics" id="d-metrics"></div>
+    <h3>听感相近<small id="d-near-count"></small></h3>
+    <ol class="near-list" id="d-near"></ol>
+    <p class="d-path" id="d-path"></p>
+  </aside>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const NS = "http://www.w3.org/2000/svg";
+    const languageNames = { zh: "中文", ja: "日语", ko: "韩语", en: "英语", unknown: "其他" };
+    const pageSize = 30;
+    let offset = 0;
+    let total = 0;
+    let lastStatus = null;
+    let stats = null;
+    let allTracks = [];
+    let points = new Map();
+    let selected = null;
+    let pollTimer, searchTimer, resizeTimer;
+    let statusRequest = 0, listRequest = 0, detailRequest = 0;
+    let previousFocus = null;
+
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined && text !== null) node.textContent = String(text);
+      return node;
+    }
+    function shape(tag, attrs) {
+      const node = document.createElementNS(NS, tag);
+      for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+      return node;
+    }
+    async function request(path, options) {
+      const response = await fetch(path, options);
+      if (!response.ok) throw new Error(String(response.status));
+      return response.json();
+    }
+    function offline(on) { $("offline").hidden = !on; }
+    function relativeTime(value) {
+      if (!value) return "—";
+      const seconds = (new Date(value).getTime() - Date.now()) / 1000;
+      const absolute = Math.abs(seconds);
+      if (absolute < 60) return seconds < 0 ? "刚刚" : "马上";
+      const [size, unit] = absolute < 3600 ? [60, "分钟"] : absolute < 86400 ? [3600, "小时"] : [86400, "天"];
+      return `${Math.round(absolute / size)} ${unit}${seconds < 0 ? "前" : "后"}`;
+    }
+    function renderTime(id, value) {
+      const node = $(id);
+      node.textContent = relativeTime(value);
+      if (value) { node.dateTime = value; node.title = new Date(value).toLocaleString("zh-CN"); }
+    }
+    function meta(track) { return [...(track.artists || []), track.album].filter(Boolean).join(" · "); }
+    function duration(value) {
+      if (value === null || value === undefined) return null;
+      const seconds = Math.floor(value);
+      return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+    }
+    function clamp(value) { return Math.max(0, Math.min(1, value)); }
+
+    // Night sky: drawn once per size, from a fixed seed so it never jumps.
+    function drawSky() {
+      const canvas = $("sky");
+      const ratio = window.devicePixelRatio || 1;
+      const width = innerWidth, height = innerHeight;
+      canvas.width = width * ratio; canvas.height = height * ratio;
+      const context = canvas.getContext("2d");
+      context.scale(ratio, ratio);
+      let seed = 7;
+      const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+      const count = Math.round(width * height / 9000);
+      for (let i = 0; i < count; i++) {
+        const x = random() * width, y = random() * height * .75;
+        const size = random() < .08 ? 1.3 : .7;
+        context.globalAlpha = (.15 + random() * .55) * (1 - y / height);
+        context.fillStyle = random() < .2 ? "#f4d9a0" : "#ffffff";
+        context.beginPath(); context.arc(x, y, size, 0, Math.PI * 2); context.fill();
+      }
+    }
+
+    function renderStatus(status) {
+      const scanning = status.state === "scanning";
+      $("status").classList.toggle("scanning", scanning);
+      $("status-text").textContent = scanning ? `扫描中 ${status.done} / ${status.total}` : "空闲";
+      $("scan").disabled = scanning;
+      $("scan").textContent = scanning ? "扫描中…" : "立即扫描";
+      $("progress").hidden = !scanning;
+      const percent = status.total ? status.done / status.total * 100 : 0;
+      $("progress-fill").style.width = `${percent}%`;
+      $("progress").setAttribute("aria-valuenow", String(Math.round(percent)));
+      $("count").textContent = status.trackCount.toLocaleString("zh-CN");
+      renderTime("last-scan", status.finishedAt);
+      renderTime("next-scan", status.nextScanAt);
+      $("scan-error").hidden = !status.error;
+      $("scan-error").textContent = status.error ? `上次扫描出错：${status.error}` : "";
+      $("failures").hidden = status.failedCount === 0;
+      $("failures-title").textContent = `有 ${status.failedCount} 首没分析成功`;
+    }
+
+    function ranking(id, items, translate) {
+      const list = $(id);
+      if (!items.length) { list.replaceChildren(el("li", "empty", "暂无记录")); return; }
+      const peak = items[0].count;
+      list.replaceChildren(...items.map((item, index) => {
+        const row = el("li");
+        row.append(el("span", "rank", String(index + 1).padStart(2, "0")));
+        const body = el("div");
+        const line = el("div", "rank-row");
+        line.append(el("span", "rank-name", translate ? languageNames[item.name] || item.name : item.name), el("span", "rank-count", item.count));
+        const bar = el("div", "rank-bar");
+        const fill = el("i");
+        fill.style.width = `${item.count / peak * 100}%`;
+        bar.append(fill);
+        body.append(line, bar);
+        row.append(body);
+        return row;
+      }));
+    }
+
+    async function loadStats() {
+      stats = await request("/api/stats");
+      ranking("languages", stats.languages, true);
+      ranking("genres", stats.genres, false);
+      ranking("artists", stats.artists, false);
+    }
+
+    async function loadAllTracks() {
+      const items = [];
+      let count = Infinity;
+      while (items.length < count) {
+        const page = await request(`/api/tracks?q=&offset=${items.length}&limit=100`);
+        count = page.total;
+        if (!page.items.length) break;
+        items.push(...page.items);
+      }
+      allTracks = items;
+    }
+
+    function renderMap() {
+      const map = $("map");
+      map.replaceChildren();
+      points = new Map();
+      const usable = allTracks.filter(track => track.bpm !== null && track.loudnessLUFS !== null);
+      $("map-empty").hidden = usable.length > 0;
+      $("map-empty").textContent = lastStatus && lastStatus.trackCount === 0 ? "还没有分析结果，等第一轮扫描完成" : "正在读取…";
+      if (!usable.length) { map.setAttribute("height", 0); return; }
+      const width = Math.max(280, $("map-wrap").clientWidth);
+      const narrow = width < 640;
+      const height = Math.round(narrow ? width * 1.05 : Math.min(560, width * .5));
+      map.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      map.setAttribute("width", width);
+      map.setAttribute("height", height);
+      const pad = { l: narrow ? 34 : 46, r: narrow ? 46 : 76, t: narrow ? 46 : 70, b: 40 };
+      const bpms = usable.map(track => track.bpm);
+      const louds = usable.map(track => track.loudnessLUFS);
+      const x0 = Math.floor(Math.min(...bpms) / 10) * 10;
+      const x1 = Math.max(x0 + 10, Math.ceil(Math.max(...bpms) / 10) * 10);
+      const y0 = Math.floor(Math.min(...louds) / 2) * 2;
+      const y1 = Math.max(y0 + 2, Math.ceil(Math.max(...louds) / 2) * 2);
+      const sx = value => pad.l + (value - x0) / (x1 - x0) * (width - pad.l - pad.r);
+      const sy = value => height - pad.b - (value - y0) / (y1 - y0) * (height - pad.t - pad.b);
+
+      const grid = shape("g", { class: "grid" });
+      const xStep = narrow ? 40 : 20;
+      for (let value = Math.ceil(x0 / xStep) * xStep; value <= x1; value += xStep) {
+        grid.append(shape("line", { x1: sx(value), x2: sx(value), y1: pad.t, y2: height - pad.b }));
+        const label = shape("text", { x: sx(value), y: height - pad.b + 18, "text-anchor": "middle" });
+        label.textContent = value;
+        grid.append(label);
+      }
+      for (let value = Math.ceil(y0 / 4) * 4; value <= y1; value += 4) {
+        grid.append(shape("line", { x1: pad.l, x2: width - pad.r, y1: sy(value), y2: sy(value) }));
+        const label = shape("text", { x: pad.l - 10, y: sy(value) + 4, "text-anchor": "end" });
+        label.textContent = value;
+        grid.append(label);
+      }
+      const faster = shape("text", { x: width - pad.r, y: height - 4, "text-anchor": "end", class: "axis" });
+      faster.textContent = "节奏更快 →";
+      const louder = shape("text", { x: pad.l, y: pad.t - 10, class: "axis" });
+      louder.textContent = "↑ 更响亮";
+      grid.append(faster, louder);
+      map.append(grid);
+
+      if (stats) {
+        const top = shape("g", { class: "bars-bpm" });
+        const bpmPeak = Math.max(1, ...stats.bpm.bins.map(bin => bin.count));
+        for (const bin of stats.bpm.bins) {
+          if (!bin.count || bin.to <= x0 || bin.from >= x1) continue;
+          const a = sx(Math.max(bin.from, x0)), z = sx(Math.min(bin.to, x1));
+          const h = Math.max(2, bin.count / bpmPeak * (pad.t - 40));
+          const w = Math.min(4, (z - a) * .3);
+          top.append(shape("rect", { x: (a + z) / 2 - w / 2, y: pad.t - 26 - h, width: w, height: h, rx: w / 2 }));
+        }
+        const side = shape("g", { class: "bars-loud" });
+        const loudPeak = Math.max(1, ...stats.loudness.bins.map(bin => bin.count));
+        for (const bin of stats.loudness.bins) {
+          if (!bin.count || bin.to <= y0 || bin.from >= y1) continue;
+          const a = sy(Math.min(bin.to, y1)), z = sy(Math.max(bin.from, y0));
+          const w = Math.max(2, bin.count / loudPeak * (pad.r - 30));
+          const h = Math.min(4, (z - a) * .3);
+          side.append(shape("rect", { x: width - pad.r + 16, y: (a + z) / 2 - h / 2, width: w, height: h, rx: h / 2 }));
+        }
+        map.append(top, side);
+      }
+
+      map.append(shape("g", { id: "links" }));
+      const stars = shape("g", {});
+      // Tempo comes in steps, so songs would stack in columns; a fixed nudge
+      // of up to about two BPM per song spreads them like a sky.
+      const unit = (width - pad.l - pad.r) / (x1 - x0);
+      const nudge = index => { const v = Math.sin(index * 12.9898 + 78.233) * 43758.5453; return v - Math.floor(v) - .5; };
+      for (const track of usable) {
+        const cx = sx(track.bpm) + nudge(track.index) * unit * 4, cy = sy(track.loudnessLUFS) + nudge(track.index + 7919) * 3;
+        const level = clamp((track.loudnessLUFS - y0) / (y1 - y0));
+        const star = shape("circle", { cx, cy, r: (2.1 + level * 1.7).toFixed(2), class: "star" });
+        star.style.opacity = (.42 + level * .55).toFixed(2);
+        star.addEventListener("mouseenter", () => showTip(track, cx, cy));
+        star.addEventListener("mouseleave", () => { $("tip").hidden = true; });
+        star.addEventListener("click", () => openDetail(track.index));
+        points.set(track.index, { x: cx, y: cy, node: star });
+        stars.append(star);
+      }
+      map.append(stars);
+      highlight();
+    }
+
+    function showTip(track, x, y) {
+      const tip = $("tip");
+      tip.replaceChildren(el("b", "", track.title), el("span", "", meta(track)), el("em", "", `${Math.round(track.bpm)} BPM · ${track.loudnessLUFS.toFixed(1)} LUFS`));
+      tip.style.left = `${Math.max(90, Math.min(x + 8, $("map-wrap").clientWidth - 90))}px`;
+      tip.style.top = `${y}px`;
+      tip.hidden = false;
+    }
+
+    function highlight() {
+      const links = $("links");
+      if (!links) return;
+      links.replaceChildren();
+      for (const point of points.values()) point.node.classList.remove("chosen", "near");
+      const from = selected && points.get(selected.index);
+      $("map").classList.toggle("focused", Boolean(from));
+      if (!from) return;
+      for (const neighbor of selected.neighbors) {
+        const to = points.get(neighbor.index);
+        if (!to) continue;
+        const line = shape("line", { x1: from.x, y1: from.y, x2: to.x, y2: to.y, class: "link" });
+        line.style.opacity = (.12 + .6 * clamp(neighbor.score)).toFixed(2);
+        links.append(line);
+        to.node.classList.add("near");
+      }
+      from.node.classList.add("chosen");
+      links.append(shape("circle", { cx: from.x, cy: from.y, r: 16, class: "halo" }));
+    }
+
+    async function loadTracks() {
+      const version = ++listRequest;
+      const query = new URLSearchParams({ q: $("search").value, offset, limit: pageSize });
+      const result = await request(`/api/tracks?${query}`);
+      if (version !== listRequest) return;
+      total = result.total;
+      const rows = result.items.map((track, index) => {
+        const item = el("li");
+        const button = el("button", "track");
+        button.type = "button";
+        button.append(el("span", "track-no", String(offset + index + 1).padStart(2, "0")));
+        const text = el("span", "track-text");
+        text.append(el("span", "track-title", track.title), el("span", "track-sub", meta(track)));
+        button.append(text, el("span", "track-bpm", track.bpm === null ? "—" : Math.round(track.bpm)));
+        const loud = el("span", "track-loud");
+        const meter = el("span", "meter");
+        const fill = el("i");
+        fill.style.width = track.loudnessLUFS === null ? "0" : `${Math.max(4, clamp((track.loudnessLUFS + 24) / 20) * 100)}%`;
+        meter.append(fill);
+        loud.append(meter, el("span", "loud-num", track.loudnessLUFS === null ? "—" : track.loudnessLUFS.toFixed(1)));
+        button.append(loud);
+        button.addEventListener("click", () => openDetail(track.index));
+        item.append(button);
+        return item;
+      });
+      $("track-list").replaceChildren(...rows);
+      $("tracks-empty").hidden = rows.length > 0;
+      $("tracks-empty").textContent = $("search").value ? "没有找到匹配的歌" : "还没有分析结果，等第一轮扫描完成";
+      $("tracks-total").textContent = $("search").value ? `找到 ${total} 首` : `共 ${total} 首，点一首看它的听感邻居`;
+      $("pager").hidden = total <= pageSize;
+      $("prev").disabled = offset === 0;
+      $("next").disabled = offset + pageSize >= total;
+      $("page").textContent = `${Math.floor(offset / pageSize) + 1} / ${Math.max(1, Math.ceil(total / pageSize))}`;
+    }
+
+    async function loadFailures() {
+      const failures = await request("/api/failures");
+      $("failure-list").replaceChildren(...failures.map(failure => {
+        const row = el("li");
+        row.append(el("code", "", failure.path), el("code", "", failure.error));
+        return row;
+      }));
+    }
+
+    function schedulePoll() {
+      clearTimeout(pollTimer);
+      if (!document.hidden) pollTimer = setTimeout(pollStatus, $("status").classList.contains("scanning") ? 2000 : 15000);
+    }
+
+    async function pollStatus() {
+      clearTimeout(pollTimer);
+      if (document.hidden) return;
+      const version = ++statusRequest;
+      try {
+        const status = await request("/api/status");
+        if (version !== statusRequest) return;
+        const changed = !lastStatus || lastStatus.trackCount !== status.trackCount || lastStatus.finishedAt !== status.finishedAt;
+        renderStatus(status);
+        lastStatus = status;
+        if (changed) {
+          await Promise.all([loadStats(), loadAllTracks(), loadTracks()]);
+          renderMap();
+          if (!$("failures").hidden && $("failures").open) await loadFailures();
+        }
+        offline(false);
+      } catch {
+        offline(true);
+      } finally {
+        if (version === statusRequest) schedulePoll();
+      }
+    }
+
+    async function openDetail(index) {
+      const version = ++detailRequest;
+      const drawer = $("drawer");
+      if (!drawer.classList.contains("open")) previousFocus = document.activeElement;
+      $("scrim").hidden = false;
+      drawer.setAttribute("aria-hidden", "false");
+      requestAnimationFrame(() => { drawer.classList.add("open"); $("scrim").classList.add("show"); });
+      $("d-title").textContent = "正在读取…";
+      $("d-sub").textContent = "";
+      $("d-chips").replaceChildren();
+      $("d-metrics").replaceChildren();
+      $("d-near").replaceChildren();
+      $("d-near-count").textContent = "";
+      $("d-path").textContent = "";
+      $("d-close").focus({ preventScroll: true });
+      try {
+        const track = await request(`/api/track?i=${index}`);
+        if (version !== detailRequest) return;
+        $("d-title").textContent = track.title;
+        $("d-sub").textContent = meta(track);
+        const chips = [track.year, track.genre, languageNames[track.lyricsLanguage] || track.lyricsLanguage].filter(Boolean);
+        $("d-chips").replaceChildren(...chips.map(value => el("span", "chip", value)));
+        const metrics = [
+          [track.bpm === null ? "—" : Math.round(track.bpm), "BPM"],
+          [track.loudnessLUFS === null ? "—" : track.loudnessLUFS.toFixed(1), "响度 LUFS"],
+          [duration(track.durationSec) || "—", "时长"],
+        ];
+        $("d-metrics").replaceChildren(...metrics.map(([value, label]) => {
+          const cell = el("div", "metric");
+          cell.append(el("span", "metric-value", value), el("span", "metric-label", label));
+          return cell;
+        }));
+        $("d-near-count").textContent = track.neighbors.length ? `${track.neighbors.length} 首` : "";
+        $("d-near").replaceChildren(...(track.neighbors.length ? track.neighbors.map(neighbor => {
+          const row = el("li");
+          const button = el("button", "near");
+          button.type = "button";
+          const text = el("span", "near-text");
+          text.append(el("span", "near-title", neighbor.title), el("span", "near-sub", (neighbor.artists || []).join(" · ")));
+          const score = el("span", "near-score", `${Math.round(clamp(neighbor.score) * 100)}%`);
+          const meter = el("span", "meter");
+          const fill = el("i");
+          fill.style.width = `${clamp(neighbor.score) * 100}%`;
+          meter.append(fill);
+          score.append(meter);
+          button.append(text, score);
+          button.addEventListener("click", () => { $("drawer").scrollTop = 0; openDetail(neighbor.index); });
+          row.append(button);
+          return row;
+        }) : [el("li", "empty", "没有足够相近的歌")]));
+        $("d-path").textContent = track.path;
+        selected = { index, neighbors: track.neighbors };
+        highlight();
+      } catch {
+        offline(true);
+        $("d-title").textContent = "连不上分析台";
+      }
+    }
+
+    function closeDetail() {
+      ++detailRequest;
+      $("drawer").classList.remove("open");
+      $("drawer").setAttribute("aria-hidden", "true");
+      $("scrim").classList.remove("show");
+      setTimeout(() => { if (!$("drawer").classList.contains("open")) $("scrim").hidden = true; }, 300);
+      selected = null;
+      highlight();
+      previousFocus?.focus({ preventScroll: true });
+    }
+
+    $("scan").addEventListener("click", async () => {
+      $("scan").disabled = true;
+      try {
+        await request("/api/scan", { method: "POST" });
+        await pollStatus();
+      } catch {
+        offline(true);
+        $("scan").disabled = false;
+      }
+    });
+    $("search").addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      ++listRequest;
+      searchTimer = setTimeout(() => { offset = 0; loadTracks().catch(() => offline(true)); }, 250);
+    });
+    $("prev").addEventListener("click", () => { offset = Math.max(0, offset - pageSize); loadTracks().catch(() => offline(true)); });
+    $("next").addEventListener("click", () => { offset += pageSize; loadTracks().catch(() => offline(true)); });
+    $("failures").addEventListener("toggle", () => { if ($("failures").open) loadFailures().catch(() => offline(true)); });
+    $("d-close").addEventListener("click", closeDetail);
+    $("scrim").addEventListener("click", closeDetail);
+    document.addEventListener("keydown", event => {
+      if (!$("drawer").classList.contains("open")) return;
+      if (event.key === "Escape") closeDetail();
+      if (event.key === "Tab") {
+        const buttons = $("drawer").querySelectorAll("button");
+        const first = buttons[0], last = buttons[buttons.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+    });
+    document.addEventListener("visibilitychange", () => { clearTimeout(pollTimer); if (!document.hidden) pollStatus(); });
+    addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => { drawSky(); renderMap(); }, 150);
+    });
+    drawSky();
+    pollStatus();
+  </script>
+</body>
+</html>

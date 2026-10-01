@@ -9,4 +9,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY analyzer/ analyzer/
 
-CMD ["python", "-m", "analyzer", "loop", "--music", "/music", "--data", "/data", "--out", "/out", "--workers", "2", "--interval-hours", "24"]
+CMD ["python", "-m", "analyzer", "run", "--music", "/music", "--data", "/data", "--out", "/out", "--workers", "2", "--interval-hours", "24", "--port", "8790"]
