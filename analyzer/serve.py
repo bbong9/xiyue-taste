@@ -11,11 +11,12 @@ from .ask import AskError
 class _Handler(http.server.SimpleHTTPRequestHandler):
     _status = None
 
-    def __init__(self, *args, data=None, state=None, index=None, asker=None, **kwargs):
+    def __init__(self, *args, data=None, state=None, index=None, asker=None, butler=None, **kwargs):
         self._data = data
         self._state = state
         self._index = index
         self._asker = asker
+        self._butler = butler
         super().__init__(*args, **kwargs)
 
     def send_response(self, code, message=None):
@@ -46,6 +47,25 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _read_json(self, limit):
+        try:
+            length = int(self.headers.get("Content-Length"))
+        except (TypeError, ValueError):
+            self._send_json({"error": "too_large"}, 413)
+            return None
+        if length > limit:
+            self._send_json({"error": "too_large"}, 413)
+            return None
+        try:
+            body = json.loads(self.rfile.read(length))
+            if not isinstance(body, dict):
+                raise ValueError("Invalid object")
+        except (ValueError, UnicodeDecodeError):
+            error = "bad_query" if urlsplit(self.path).path == "/api/ask" else "bad_request"
+            self._send_json({"error": error}, 400)
+            return None
+        return body
 
     @staticmethod
     def _integer(query, name, default):
@@ -109,18 +129,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 if self._asker is None:
                     self._send_json({"error": "ask_unconfigured"}, 503)
                     return
-                try:
-                    length = int(self.headers.get("Content-Length"))
-                except (TypeError, ValueError):
-                    self._send_json({"error": "too_large"}, 413)
-                    return
-                if length > 4096:
-                    self._send_json({"error": "too_large"}, 413)
-                    return
-                try:
-                    body = json.loads(self.rfile.read(length))
-                except (ValueError, UnicodeDecodeError):
-                    self._send_json({"error": "bad_query"}, 400)
+                body = self._read_json(4096)
+                if body is None:
                     return
                 q = body.get("q") if isinstance(body, dict) else None
                 if not isinstance(q, str) or not q.strip() or len(q.strip()) > 100:
@@ -130,15 +140,50 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     self._send_json(self._asker.ask(q.strip()))
                 except AskError as error:
                     self._send_json({"error": error.code}, error.status)
+            elif path in ("/api/butler/artists", "/api/butler/songs") and self._panel_available():
+                if self._butler is None:
+                    self._send_json({"error": "ask_unconfigured"}, 503)
+                    return
+                body = self._read_json(262144)
+                if body is None:
+                    return
+                if path == "/api/butler/artists":
+                    items = body.get("artists")
+                    valid = isinstance(items, list) and 1 <= len(items) <= 600 and all(
+                        isinstance(item, dict)
+                        and isinstance(item.get("name"), str) and 1 <= len(item["name"]) <= 100
+                        and type(item.get("songs")) is int and item["songs"] >= 0
+                        for item in items
+                    )
+                    method = self._butler.artists
+                else:
+                    items = body.get("songs")
+                    valid = isinstance(items, list) and 1 <= len(items) <= 60 and all(
+                        isinstance(item, dict)
+                        and isinstance(item.get("id"), str) and bool(item["id"])
+                        and all(isinstance(item.get(key), str) and len(item[key]) <= 500
+                                for key in ("title", "album", "path"))
+                        and isinstance(item.get("artists"), list)
+                        and all(isinstance(name, str) for name in item["artists"])
+                        for item in items
+                    )
+                    method = self._butler.songs
+                if not valid:
+                    self._send_json({"error": "bad_request"}, 400)
+                    return
+                try:
+                    self._send_json(method(items))
+                except AskError as error:
+                    self._send_json({"error": error.code}, error.status)
             else:
                 self._send_json({"error": "not_found"}, 404)
         else:
             self.send_error(501, "Unsupported method ('POST')")
 
 
-def make_server(out, port, data=None, state=None, index=None, asker=None):
+def make_server(out, port, data=None, state=None, index=None, asker=None, butler=None):
     handler = functools.partial(
-        _Handler, directory=str(out), data=data, state=state, index=index, asker=asker
+        _Handler, directory=str(out), data=data, state=state, index=index, asker=asker, butler=butler
     )
     return http.server.ThreadingHTTPServer(("", port), handler)
 

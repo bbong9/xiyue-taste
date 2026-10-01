@@ -4,6 +4,7 @@ import threading
 import time
 
 from .ask import Asker
+from .butler import Butler
 from .panel import OutputIndex, PanelState
 from .scan import scan
 from .serve import make_server
@@ -33,14 +34,13 @@ def main():
         os.nice(15)
         state = PanelState()
         index = OutputIndex(args.out)
-        asker = Asker(
-            index,
-            os.environ.get("TASTE_LLM_API_KEY", ""),
-            os.environ.get("TASTE_LLM_BASE_URL", "https://api.siliconflow.cn/v1"),
-            os.environ.get("TASTE_LLM_MODEL", "deepseek-ai/DeepSeek-V3.2"),
-        )
+        api_key = os.environ.get("TASTE_LLM_API_KEY", "")
+        base_url = os.environ.get("TASTE_LLM_BASE_URL", "https://api.siliconflow.cn/v1")
+        model = os.environ.get("TASTE_LLM_MODEL", "deepseek-ai/DeepSeek-V3.2")
+        asker = Asker(index, api_key, base_url, model)
+        butler = Butler(api_key, base_url, model)
         server = make_server(
-            args.out, args.port, data=args.data, state=state, index=index, asker=asker
+            args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
         print(f"Serving on port {args.port}.", flush=True)

@@ -1,7 +1,7 @@
-import json
 import urllib.error
 import urllib.request
 
+from .llm import chat_json
 
 SYSTEM_PROMPT = """你是私人音乐库的选歌助手。只能从给出的曲库里选，按最符合要求的顺序挑最多 20 首。
 BPM 越大节奏越快；响度 LUFS 越接近 0 越响，越小越安静。
@@ -41,31 +41,11 @@ class Asker:
                 ])
                 for i, track in enumerate(tracks)
             )
-            body = {
-                "model": self._model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": "曲库（编号|歌名|歌手|风格|语种|BPM|响度LUFS）：\n"
-                        + catalog + "\n\n要求：" + query,
-                    },
-                ],
-                "temperature": 0.3,
-                "max_tokens": 400,
-            }
-            request = urllib.request.Request(
-                self._base_url.rstrip("/") + "/chat/completions",
-                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                headers={
-                    "Authorization": "Bearer " + self._api_key,
-                    "Content-Type": "application/json",
-                },
-                method="POST",
+            result = chat_json(
+                self._api_key, self._base_url, self._model, SYSTEM_PROMPT,
+                "曲库（编号|歌名|歌手|风格|语种|BPM|响度LUFS）：\n" + catalog + "\n\n要求：" + query,
+                400, self._timeout, self._urlopen,
             )
-            with self._urlopen(request, timeout=self._timeout) as response:
-                content = json.loads(response.read())["choices"][0]["message"]["content"]
-            result = json.loads(content[content.index("{"):content.rindex("}") + 1])
             if not isinstance(result, dict) or not isinstance(result.get("picks"), list):
                 raise ValueError("Invalid picks")
             picks = list(dict.fromkeys(

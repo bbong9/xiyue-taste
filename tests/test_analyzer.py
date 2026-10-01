@@ -496,3 +496,92 @@ def test_ask_http_body_validation(tmp_path, length, body, status, error):
         connection.close()
         server.shutdown()
         server.server_close()
+
+
+from analyzer.butler import Butler
+
+
+def test_butler_artists_filters_groups_and_uses_original_names():
+    content = '```json\n{"groups":[{"names":[0,1,9],"to":1},{"names":[1,2],"to":2},{"names":[3],"to":3},{"names":[4,5],"to":7}]}\n```'
+    urlopen, calls = _fake_llm(content)
+    artists = [{"name": name, "songs": i + 1} for i, name in enumerate(
+        ["周杰倫", "周杰伦", "Jay Chou", "A", "B", "C"]
+    )]
+    result = Butler("test-key", "https://example.com/v1", "test-model", urlopen=urlopen).artists(artists)
+    assert result == {"groups": [{"names": ["周杰倫", "周杰伦"], "to": "周杰伦"}]}
+    body = json.loads(calls[0][0].data)
+    assert "0|周杰倫|1" in body["messages"][1]["content"]
+    assert body["max_tokens"] == 2000
+    assert calls[0][1] == 120
+
+
+def test_butler_songs_keeps_first_change_and_original_id():
+    urlopen, calls = _fake_llm('{"songs":[{"i":0,"title":"夜曲"},{"i":0,"title":"x"},{"i":1,"title":"原歌名"},{"i":2,"album":""},{"i":5,"title":"y"}]}')
+    songs = [
+        {"id": "a", "title": "夜曲 无损", "album": "", "artists": ["周杰伦"], "path": "/音乐/夜曲.flac"},
+        {"id": "b", "title": "原歌名", "album": "", "artists": [], "path": "b.flac"},
+        {"id": "c", "title": "C", "album": "", "artists": [], "path": "c.flac"},
+    ]
+    result = Butler("test-key", "https://example.com/v1", "test-model", urlopen=urlopen).songs(songs)
+    assert result == {"songs": [{"id": "a", "title": "夜曲"}]}
+    body = json.loads(calls[0][0].data)
+    assert "/音乐/夜曲.flac" in body["messages"][1]["content"]
+    assert body["max_tokens"] == 3000
+
+
+@pytest.mark.parametrize("method", ["artists", "songs"])
+def test_butler_missing_key_never_calls_model(method):
+    urlopen, calls = _fake_llm('{}')
+    with pytest.raises(AskError) as failure:
+        getattr(Butler("", "https://example.com/v1", "test-model", urlopen=urlopen), method)([])
+    assert (failure.value.code, failure.value.status) == ("ask_unconfigured", 503)
+    assert calls == []
+
+
+@pytest.mark.parametrize("method", ["artists", "songs"])
+@pytest.mark.parametrize("content", [None, "not JSON", "{}"])
+def test_butler_network_and_bad_response_errors(method, content):
+    def offline(request, timeout):
+        raise urllib.error.URLError("offline")
+    urlopen = offline if content is None else _fake_llm(content)[0]
+    with pytest.raises(AskError) as failure:
+        getattr(Butler("test-key", "https://example.com/v1", "test-model", urlopen=urlopen), method)([])
+    assert (failure.value.code, failure.value.status) == ("ask_failed", 502)
+
+
+@pytest.mark.parametrize(("kind", "count", "configured", "status"), [
+    ("artists", 0, True, 400), ("artists", 601, True, 400),
+    ("artists", 1, False, 503), ("artists", 1, True, 200),
+    ("songs", 61, True, 400), ("songs", 1, True, 200),
+])
+def test_butler_http_limits_and_results(tmp_path, kind, count, configured, status):
+    calls = []
+    class FakeButler:
+        def artists(self, items):
+            calls.append(items)
+            return {"groups": []}
+        def songs(self, items):
+            calls.append(items)
+            return {"songs": []}
+    item = {"name": "周杰伦", "songs": 3} if kind == "artists" else {
+        "id": "a", "title": "夜曲", "album": "", "artists": ["周杰伦"], "path": "a.flac",
+    }
+    server = make_server(tmp_path, 0, data=tmp_path, state=PanelState(), index=_AskIndex(),
+                         butler=FakeButler() if configured else None)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+    try:
+        items = [item] * count
+        connection.request("POST", "/api/butler/" + kind, json.dumps({kind: items}).encode("utf-8"),
+                           {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        assert response.status == status
+        expected = {"groups" if kind == "artists" else "songs": []} if status == 200 else {
+            "error": "ask_unconfigured" if status == 503 else "bad_request",
+        }
+        assert json.loads(response.read()) == expected
+        assert calls == ([items] if status == 200 else [])
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
