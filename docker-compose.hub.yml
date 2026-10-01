@@ -1,0 +1,18 @@
+# 直接拉取 Docker Hub 上的镜像运行，不需要源码。
+# 同目录放一个 .env，写两行：
+#   MUSIC_DIR=/你的音乐目录
+#   OUT_DIR=/分析结果输出目录
+services:
+  taste:
+    container_name: xiyue-taste
+    image: bbong9/xiyue-taste:latest
+    pull_policy: always
+    volumes:
+      - "${MUSIC_DIR}:/music:ro"
+      - "./data:/data"
+      - "${OUT_DIR}:/out"
+    ports:
+      - "0.0.0.0:8790:8790"
+    cpus: "2.0"
+    mem_limit: 2g
+    restart: unless-stopped
