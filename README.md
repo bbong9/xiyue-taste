@@ -1,6 +1,6 @@
 # 汐乐曲库分析与分析台容器
 
-一个容器 `xiyue-taste` 同时运行曲库分析和网页分析台：只读扫描音乐目录，将音频特征、标签、歌词语种和每首歌最相近的 20 首写入 `xiyue-taste-v1.json.gz`，在局域网提供分析状态、曲库画像、曲目详情及 App 结果下载。不调用外部 API，不修改音乐文件或标签。
+一个容器 `xiyue-taste` 同时运行曲库分析和网页分析台：只读扫描音乐目录，将音频特征、标签、歌词语种和每首歌最相近的 20 首写入 `xiyue-taste-v1.json.gz`，在局域网提供分析状态、曲库画像、曲目详情及 App 结果下载。曲库分析不调用外部 API，不修改音乐文件或标签。
 
 ## 在飞牛 NAS 部署
 
@@ -46,6 +46,18 @@ python -m analyzer run --music /music --data /data --out /out --workers 2 --inte
 浏览器打开 `http://<NAS 局域网 IP>:8790/` 是分析台；`http://<NAS 局域网 IP>:8790/xiyue-taste-v1.json.gz` 是汐乐 App 使用的文件。
 
 文件响应保留 `Content-Encoding: gzip`、`Content-Type: application/json` 和 `Last-Modified`，支持 `If-Modified-Since`，文件没变时返回 304。没有登录验证，任何能打开页面的人都能点「立即扫描」，不要把这个端口映射到公网。
+
+## 说一句找歌
+
+`POST /api/ask` 接收 JSON `{"q":"下雨天安静一点的"}`，去掉首尾空白后限 1～100 字。返回 `reason` 和最多 20 个 `items`，每项包含分析结果里的 `index`、`title`、`artists`、`path`。
+
+Compose 从同目录的 `.env` 读取以下环境变量并传给容器：
+
+- `TASTE_LLM_API_KEY`：硅基流动密钥，只放在 `.env`，不要写入代码、日志或提交到 Git；不填时接口返回 503。
+- `TASTE_LLM_BASE_URL`：默认 `https://api.siliconflow.cn/v1`。
+- `TASTE_LLM_MODEL`：默认 `deepseek-ai/DeepSeek-V3.2`。
+
+使用此接口会把查询原文、曲库歌名、歌手、风格、语种、BPM 和响度发给模型服务商。
 
 ## 从旧版本升级
 

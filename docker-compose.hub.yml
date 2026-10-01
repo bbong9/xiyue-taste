@@ -1,12 +1,17 @@
 # 直接拉取 Docker Hub 上的镜像运行，不需要源码。
-# 同目录放一个 .env，写两行：
+# 同目录放一个 .env，填写：
 #   MUSIC_DIR=/你的音乐目录
 #   OUT_DIR=/分析结果输出目录
+#   TASTE_LLM_API_KEY=硅基流动密钥（不填则“说一句找歌”不可用）
 services:
   taste:
     container_name: xiyue-taste
     image: bbong9/xiyue-taste:latest
     pull_policy: always
+    environment:
+      TASTE_LLM_API_KEY: "${TASTE_LLM_API_KEY:-}"
+      TASTE_LLM_BASE_URL: "${TASTE_LLM_BASE_URL:-https://api.siliconflow.cn/v1}"
+      TASTE_LLM_MODEL: "${TASTE_LLM_MODEL:-deepseek-ai/DeepSeek-V3.2}"
     volumes:
       - "${MUSIC_DIR}:/music:ro"
       - "./data:/data"

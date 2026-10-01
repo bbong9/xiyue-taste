@@ -3,6 +3,10 @@ services:
     container_name: xiyue-taste
     build: .
     image: xiyue-taste
+    environment:
+      TASTE_LLM_API_KEY: "${TASTE_LLM_API_KEY:-}"
+      TASTE_LLM_BASE_URL: "${TASTE_LLM_BASE_URL:-https://api.siliconflow.cn/v1}"
+      TASTE_LLM_MODEL: "${TASTE_LLM_MODEL:-deepseek-ai/DeepSeek-V3.2}"
     volumes:
       - "${MUSIC_DIR}:/music:ro"
       - "./data:/data"

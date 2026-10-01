@@ -1,4 +1,6 @@
 import gzip
+import http.client
+import io
 import json
 import os
 import sqlite3
@@ -18,6 +20,7 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analyzer import ANALYZER_VERSION
+from analyzer.ask import Asker, AskError
 from analyzer.features import extract_features
 from analyzer.output import write_output
 from analyzer.scan import scan
@@ -325,3 +328,171 @@ def test_scan_reports_initial_and_completed_progress(tmp_path):
     assert updates[0] == (0, 2)
     assert updates[-1] == (2, 2)
     assert updates == [(0, 2), (1, 2), (2, 2)]
+
+
+class _AskIndex:
+    def load(self):
+        return [
+            {"title": "First", "artists": ["A", "B"], "path": "first.wav",
+             "genre": "Pop", "lyricsLanguage": "en", "bpm": 120.6, "loudnessLUFS": -15.26},
+            {"title": "Second", "artists": None, "path": "second.wav",
+             "genre": None, "lyricsLanguage": None, "bpm": None, "loudnessLUFS": None},
+            {"title": "第三首", "artists": ["歌手"], "path": "third.wav",
+             "genre": "Ambient", "lyricsLanguage": "zh", "bpm": 60, "loudnessLUFS": -25},
+        ]
+
+
+def _fake_llm(content):
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append((request, timeout))
+        return io.BytesIO(json.dumps({
+            "choices": [{"message": {"content": content}}],
+        }).encode("utf-8"))
+
+    return urlopen, calls
+
+
+def test_ask_without_key_does_not_call_model():
+    urlopen, calls = _fake_llm('{"picks":[]}')
+    asker = Asker(_AskIndex(), "", "https://example.com/v1", "test-model", urlopen=urlopen)
+    with pytest.raises(AskError) as failure:
+        asker.ask("安静")
+    assert (failure.value.code, failure.value.status) == ("ask_unconfigured", 503)
+    assert calls == []
+
+
+def test_ask_selects_valid_unique_indices_and_sends_catalog():
+    urlopen, calls = _fake_llm('```json\n{"reason":"安静","picks":[2,0,2,9,"x"]}\n```')
+    asker = Asker(
+        _AskIndex(), "test-key", "https://example.com/v1/", "test-model",
+        timeout=42, urlopen=urlopen,
+    )
+    result = asker.ask("下雨天安静一点的")
+    assert result == {
+        "reason": "安静",
+        "items": [
+            {"index": 2, "title": "第三首", "artists": ["歌手"], "path": "third.wav"},
+            {"index": 0, "title": "First", "artists": ["A", "B"], "path": "first.wav"},
+        ],
+    }
+    assert len(calls) == 1
+    request, timeout = calls[0]
+    assert request.full_url == "https://example.com/v1/chat/completions"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == "Bearer test-key"
+    assert request.get_header("Content-type") == "application/json"
+    assert timeout == 42
+    body = json.loads(request.data)
+    assert body["model"] == "test-model"
+    assert body["temperature"] == 0.3
+    assert body["max_tokens"] == 400
+    content = body["messages"][1]["content"]
+    assert "下雨天安静一点的" in content
+    assert "2|第三首|歌手|Ambient|zh|60|-25.0" in content
+    assert "0|First|A/B|Pop|en|121|-15.3" in content
+    assert "1|Second|||||" in content
+
+
+@pytest.mark.parametrize("error", [
+    urllib.error.URLError("offline"),
+    urllib.error.HTTPError("https://example.com/v1", 500, "failed", {}, None),
+    TimeoutError(),
+])
+def test_ask_network_errors_are_generic(error):
+    def urlopen(request, timeout):
+        raise error
+
+    asker = Asker(_AskIndex(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen)
+    with pytest.raises(AskError) as failure:
+        asker.ask("安静")
+    assert (failure.value.code, failure.value.status) == ("ask_failed", 502)
+
+
+@pytest.mark.parametrize("content", ["not JSON", '{"picks":{}}', '{"reason":"安静"}', None])
+def test_ask_invalid_model_content_fails(content):
+    urlopen, _ = _fake_llm(content)
+    asker = Asker(_AskIndex(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen)
+    with pytest.raises(AskError) as failure:
+        asker.ask("安静")
+    assert (failure.value.code, failure.value.status) == ("ask_failed", 502)
+
+
+@pytest.mark.parametrize(("reason", "picks", "expected_reason", "expected_indices"), [
+    (None, [], "", []),
+    ("静" * 61, [True, False, -1, 1.0, 2], "静" * 60, [2]),
+])
+def test_ask_empty_results_reason_and_integer_filter(reason, picks, expected_reason, expected_indices):
+    urlopen, _ = _fake_llm(json.dumps({"reason": reason, "picks": picks}))
+    asker = Asker(_AskIndex(), "test-key", "https://example.com/v1", "test-model", urlopen=urlopen)
+    result = asker.ask("安静")
+    assert result["reason"] == expected_reason
+    assert [item["index"] for item in result["items"]] == expected_indices
+
+
+@pytest.mark.parametrize(("body", "configured", "ask_error", "status", "expected"), [
+    ({"q": ""}, True, None, 400, {"error": "bad_query"}),
+    ({"q": " "}, True, None, 400, {"error": "bad_query"}),
+    ({"q": "静" * 101}, True, None, 400, {"error": "bad_query"}),
+    ({"q": 1}, True, None, 400, {"error": "bad_query"}),
+    ([], True, None, 400, {"error": "bad_query"}),
+    ({"q": "安静"}, False, None, 503, {"error": "ask_unconfigured"}),
+    ({"q": "安静"}, True, AskError("ask_failed", 502), 502, {"error": "ask_failed"}),
+    ({"q": "安静"}, True, AskError("ask_unconfigured", 503), 503, {"error": "ask_unconfigured"}),
+    ({"q": " 安静 "}, True, None, 200, {"reason": "安静", "items": [{"index": 2}]}),
+])
+def test_ask_http_queries(tmp_path, body, configured, ask_error, status, expected):
+    queries = []
+
+    class FakeAsker:
+        def ask(self, query):
+            queries.append(query)
+            if ask_error is not None:
+                raise ask_error
+            return {"reason": "安静", "items": [{"index": 2}]}
+
+    server = make_server(
+        tmp_path, 0, data=tmp_path / "data", state=PanelState(), index=_AskIndex(),
+        asker=FakeAsker() if configured else None,
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+    try:
+        connection.request("POST", "/api/ask", json.dumps(body).encode("utf-8"),
+                           {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        assert response.status == status
+        assert json.loads(response.read()) == expected
+        assert queries == (["安静"] if status == 200 or ask_error is not None else [])
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(("length", "body", "status", "error"), [
+    (None, b"", 413, "too_large"),
+    ("invalid", b"", 413, "too_large"),
+    ("4097", b"", 413, "too_large"),
+    ("1", b"{", 400, "bad_query"),
+])
+def test_ask_http_body_validation(tmp_path, length, body, status, error):
+    server = make_server(
+        tmp_path, 0, data=tmp_path / "data", state=PanelState(), index=_AskIndex(),
+        asker=object(),
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+    try:
+        connection.putrequest("POST", "/api/ask")
+        if length is not None:
+            connection.putheader("Content-Length", length)
+        connection.endheaders(body)
+        response = connection.getresponse()
+        assert response.status == status
+        assert json.loads(response.read()) == {"error": error}
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()

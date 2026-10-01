@@ -5,14 +5,17 @@ import json
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from .ask import AskError
+
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
     _status = None
 
-    def __init__(self, *args, data=None, state=None, index=None, **kwargs):
+    def __init__(self, *args, data=None, state=None, index=None, asker=None, **kwargs):
         self._data = data
         self._state = state
         self._index = index
+        self._asker = asker
         super().__init__(*args, **kwargs)
 
     def send_response(self, code, message=None):
@@ -102,15 +105,40 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             if path == "/api/scan" and self._panel_available():
                 self._state.request_scan()
                 self._send_json({"ok": True})
+            elif path == "/api/ask" and self._panel_available():
+                if self._asker is None:
+                    self._send_json({"error": "ask_unconfigured"}, 503)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length"))
+                except (TypeError, ValueError):
+                    self._send_json({"error": "too_large"}, 413)
+                    return
+                if length > 4096:
+                    self._send_json({"error": "too_large"}, 413)
+                    return
+                try:
+                    body = json.loads(self.rfile.read(length))
+                except (ValueError, UnicodeDecodeError):
+                    self._send_json({"error": "bad_query"}, 400)
+                    return
+                q = body.get("q") if isinstance(body, dict) else None
+                if not isinstance(q, str) or not q.strip() or len(q.strip()) > 100:
+                    self._send_json({"error": "bad_query"}, 400)
+                    return
+                try:
+                    self._send_json(self._asker.ask(q.strip()))
+                except AskError as error:
+                    self._send_json({"error": error.code}, error.status)
             else:
                 self._send_json({"error": "not_found"}, 404)
         else:
             self.send_error(501, "Unsupported method ('POST')")
 
 
-def make_server(out, port, data=None, state=None, index=None):
+def make_server(out, port, data=None, state=None, index=None, asker=None):
     handler = functools.partial(
-        _Handler, directory=str(out), data=data, state=state, index=index
+        _Handler, directory=str(out), data=data, state=state, index=index, asker=asker
     )
     return http.server.ThreadingHTTPServer(("", port), handler)
 
