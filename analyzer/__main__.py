@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import os
 import threading
 import time
@@ -31,6 +32,14 @@ def main():
     args = parser.parse_args()
 
     if args.command == "run":
+        access_token = os.environ.get("TASTE_ACCESS_TOKEN", "")
+        try:
+            trusted_network = ipaddress.ip_network(
+                os.environ.get("TASTE_TRUSTED_NETWORK", "192.168.50.0/24"), strict=False
+            )
+        except ValueError:
+            raise SystemExit("bad TASTE_TRUSTED_NETWORK")
+        host_ip = os.environ.get("TASTE_HOST_IP", "192.168.50.2")
         os.nice(15)
         state = PanelState()
         index = OutputIndex(args.out)
@@ -40,7 +49,8 @@ def main():
         asker = Asker(index, api_key, base_url, model)
         butler = Butler(api_key, base_url, model)
         server = make_server(
-            args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler
+            args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler,
+            access_token=access_token, trusted_network=trusted_network, host_ip=host_ip,
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
         print(f"Serving on port {args.port}.", flush=True)

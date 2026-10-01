@@ -1,9 +1,11 @@
 import argparse
 import functools
+import hmac
 import http.server
+import ipaddress
 import json
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .ask import AskError
 
@@ -11,12 +13,19 @@ from .ask import AskError
 class _Handler(http.server.SimpleHTTPRequestHandler):
     _status = None
 
-    def __init__(self, *args, data=None, state=None, index=None, asker=None, butler=None, **kwargs):
+    def __init__(
+        self, *args, data=None, state=None, index=None, asker=None, butler=None,
+        access_token="", trusted_network=ipaddress.ip_network("192.168.50.0/24"),
+        host_ip="192.168.50.2", **kwargs,
+    ):
         self._data = data
         self._state = state
         self._index = index
         self._asker = asker
         self._butler = butler
+        self._access_token = access_token
+        self._trusted_network = trusted_network
+        self._host_ip = host_ip
         super().__init__(*args, **kwargs)
 
     def send_response(self, code, message=None):
@@ -39,10 +48,29 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     def _panel_available(self):
         return self._data is not None and self._state is not None and self._index is not None
 
+    def _is_trusted(self) -> bool:
+        address = ipaddress.ip_address(self.client_address[0])
+        return (
+            address in self._trusted_network
+            and str(address).rsplit(".", 1)[-1] != "1"
+            and str(address) != self._host_ip
+            and not any(header in self.headers for header in ("X-Forwarded-For", "X-Real-IP", "Forwarded"))
+        )
+
+    def _authorized(self) -> bool:
+        if self._is_trusted():
+            return True
+        return bool(self._access_token) and hmac.compare_digest(
+            self.headers.get("Authorization", "").encode("utf-8"),
+            ("Bearer " + self._access_token).encode("utf-8"),
+        )
+
     def _send_json(self, value, status=200):
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", "application/json" if status == 401 else "application/json; charset=utf-8")
+        if status == 401:
+            self.send_header("WWW-Authenticate", "Bearer")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -75,6 +103,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return default
 
     def do_GET(self):
+        path = unquote(urlsplit(self.path).path)
+        if path not in ("/", "/index.html") and not self._authorized():
+            self._send_json({"error": "unauthorized"}, 401)
+            return
         url = urlsplit(self.path)
         if url.path in ("/", "/index.html"):
             if not self._panel_available():
@@ -124,6 +156,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self):
+        path = unquote(urlsplit(self.path).path)
+        if path not in ("/", "/index.html") and not self._authorized():
+            self._send_json({"error": "unauthorized"}, 401)
+            return
         path = urlsplit(self.path).path
         if path.startswith("/api/"):
             if path == "/api/scan" and self._panel_available():
@@ -191,9 +227,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.send_error(501, "Unsupported method ('POST')")
 
 
-def make_server(out, port, data=None, state=None, index=None, asker=None, butler=None):
+def make_server(
+    out, port, data=None, state=None, index=None, asker=None, butler=None,
+    access_token="", trusted_network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2",
+):
     handler = functools.partial(
-        _Handler, directory=str(out), data=data, state=state, index=index, asker=asker, butler=butler
+        _Handler, directory=str(out), data=data, state=state, index=index, asker=asker, butler=butler,
+        access_token=access_token, trusted_network=trusted_network, host_ip=host_ip,
     )
     return http.server.ThreadingHTTPServer(("", port), handler)
 

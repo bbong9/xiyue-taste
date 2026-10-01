@@ -304,6 +304,12 @@
   <p class="offline" id="offline" hidden>连不上分析台，正在重试…</p>
 
   <div class="page">
+    <form class="top" id="access-token-form" hidden>
+      <label class="search">
+        <input id="access-token" type="password" placeholder="访问口令" aria-label="访问口令" autocomplete="current-password">
+      </label>
+      <button class="scan" type="submit">保存</button>
+    </form>
     <header class="top">
       <div class="brand">
         <svg viewBox="0 0 32 32" aria-hidden="true">
@@ -419,12 +425,21 @@
       for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
       return node;
     }
-    async function request(path, options) {
-      const response = await fetch(path, options);
+    async function api(path, options) {
+      const headers = new Headers(options?.headers);
+      let token;
+      try {
+        token = localStorage.getItem("xiyue-taste-token");
+      } catch {
+        token = null;
+      }
+      if (token) headers.set("Authorization", "Bearer " + token);
+      const response = await fetch(path, { ...options, headers });
+      if (response.status === 401) $("access-token-form").hidden = false;
       if (!response.ok) throw new Error(String(response.status));
       return response.json();
     }
-    function offline(on) { $("offline").hidden = !on; }
+    function offline(on) { $("offline").hidden = !on || !$("access-token-form").hidden; }
     function relativeTime(value) {
       if (!value) return "—";
       const seconds = (new Date(value).getTime() - Date.now()) / 1000;
@@ -506,7 +521,7 @@
     }
 
     async function loadStats() {
-      stats = await request("/api/stats");
+      stats = await api("/api/stats");
       ranking("languages", stats.languages, true);
       ranking("genres", stats.genres, false);
       ranking("artists", stats.artists, false);
@@ -516,7 +531,7 @@
       const items = [];
       let count = Infinity;
       while (items.length < count) {
-        const page = await request(`/api/tracks?q=&offset=${items.length}&limit=100`);
+        const page = await api(`/api/tracks?q=&offset=${items.length}&limit=100`);
         count = page.total;
         if (!page.items.length) break;
         items.push(...page.items);
@@ -643,7 +658,7 @@
     async function loadTracks() {
       const version = ++listRequest;
       const query = new URLSearchParams({ q: $("search").value, offset, limit: pageSize });
-      const result = await request(`/api/tracks?${query}`);
+      const result = await api(`/api/tracks?${query}`);
       if (version !== listRequest) return;
       total = result.total;
       const rows = result.items.map((track, index) => {
@@ -676,7 +691,7 @@
     }
 
     async function loadFailures() {
-      const failures = await request("/api/failures");
+      const failures = await api("/api/failures");
       $("failure-list").replaceChildren(...failures.map(failure => {
         const row = el("li");
         row.append(el("code", "", failure.path), el("code", "", failure.error));
@@ -694,7 +709,7 @@
       if (document.hidden) return;
       const version = ++statusRequest;
       try {
-        const status = await request("/api/status");
+        const status = await api("/api/status");
         if (version !== statusRequest) return;
         const changed = !lastStatus || lastStatus.trackCount !== status.trackCount || lastStatus.finishedAt !== status.finishedAt;
         renderStatus(status);
@@ -728,7 +743,7 @@
       $("d-path").textContent = "";
       $("d-close").focus({ preventScroll: true });
       try {
-        const track = await request(`/api/track?i=${index}`);
+        const track = await api(`/api/track?i=${index}`);
         if (version !== detailRequest) return;
         $("d-title").textContent = track.title;
         $("d-sub").textContent = meta(track);
@@ -782,10 +797,22 @@
       previousFocus?.focus({ preventScroll: true });
     }
 
+    $("access-token-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      try {
+        localStorage.setItem("xiyue-taste-token", $("access-token").value);
+      } catch {
+        $("access-token-form").hidden = false;
+        return;
+      }
+      $("access-token-form").hidden = true;
+      lastStatus = null;
+      await pollStatus();
+    });
     $("scan").addEventListener("click", async () => {
       $("scan").disabled = true;
       try {
-        await request("/api/scan", { method: "POST" });
+        await api("/api/scan", { method: "POST" });
         await pollStatus();
       } catch {
         offline(true);

@@ -7,6 +7,9 @@ services:
       TASTE_LLM_API_KEY: "${TASTE_LLM_API_KEY:-}"
       TASTE_LLM_BASE_URL: "${TASTE_LLM_BASE_URL:-https://api.siliconflow.cn/v1}"
       TASTE_LLM_MODEL: "${TASTE_LLM_MODEL:-deepseek-ai/DeepSeek-V3.2}"
+      TASTE_ACCESS_TOKEN: "${TASTE_ACCESS_TOKEN:-}"
+      TASTE_TRUSTED_NETWORK: "${TASTE_TRUSTED_NETWORK:-192.168.50.0/24}"
+      TASTE_HOST_IP: "${TASTE_HOST_IP:-192.168.50.2}"
     volumes:
       - "${MUSIC_DIR}:/music:ro"
       - "./data:/data"

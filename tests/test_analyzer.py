@@ -24,7 +24,7 @@ from analyzer.ask import Asker, AskError
 from analyzer.features import extract_features
 from analyzer.output import write_output
 from analyzer.scan import scan
-from analyzer.serve import make_server
+from analyzer.serve import _Handler, make_server
 from analyzer.similarity import build_similarity
 from analyzer.tags import lyrics_language, read_tags
 
@@ -655,5 +655,86 @@ def test_ask_http_status_does_not_expose_key_or_call_model(tmp_path, configured)
             assert json.loads(body) == {"configured": configured, "model": "test-model" if configured else ""}
         assert calls == []
     finally:
+        server.shutdown()
+        server.server_close()
+
+
+
+@pytest.fixture(autouse=True)
+def _trust_local_client(request, monkeypatch):
+    """Tests that are not about access control talk to the server directly."""
+    if not request.node.name.startswith("test_access_"):
+        monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
+
+
+@pytest.mark.parametrize(("address", "forwarded_header", "trusted"), [
+    ("192.168.50.23", None, True),
+    ("192.168.50.1", None, False),
+    ("192.168.96.1", None, False),
+    ("192.168.50.2", None, False),
+    ("10.0.0.5", None, False),
+    ("192.168.50.23", "X-Forwarded-For", False),
+    ("192.168.50.23", "X-Real-IP", False),
+    ("192.168.50.23", "Forwarded", False),
+])
+def test_access_trust_requires_direct_home_client(address, forwarded_header, trusted):
+    import ipaddress
+    from email.message import Message
+    from analyzer.serve import _Handler
+
+    handler = object.__new__(_Handler)
+    handler._trusted_network = ipaddress.ip_network("192.168.50.0/24")
+    handler._host_ip = "192.168.50.2"
+    handler.client_address = (address, 12345)
+    handler.headers = Message()
+    if forwarded_header:
+        handler.headers[forwarded_header] = "1.2.3.4"
+    assert handler._is_trusted() is trusted
+
+
+@pytest.mark.parametrize(("method", "path", "token", "authorization", "status"), [
+    ("GET", "/api/ask/status", "test-token", None, 401),
+    ("GET", "/api/ask/status", "test-token", "Bearer test-token", 200),
+    ("GET", "/api/ask/status", "test-token", "Bearer wrong-token", 401),
+    ("GET", "/", "test-token", None, 200),
+    ("GET", "/xiyue-taste-v1.json.gz", "test-token", None, 401),
+    ("GET", "/api/ask/status", "", None, 401),
+    ("POST", "/api/scan", "test-token", None, 401),
+    ("POST", "/api/scan", "test-token", "Bearer test-token", 200),
+    ("GET", "/xiyue-taste-v1%2ejson.gz", "test-token", None, 401),
+])
+def test_access_http_requires_token_outside_trusted_network(
+    tmp_path, method, path, token, authorization, status,
+):
+    import ipaddress
+
+    state = PanelState()
+    server = make_server(
+        tmp_path, 0, data=tmp_path, state=state, index=_AskIndex(),
+        access_token=token, trusted_network=ipaddress.ip_network("192.168.50.0/24"),
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+    headers = {"X-Forwarded-For": "1.2.3.4"}
+    if authorization is not None:
+        headers["Authorization"] = authorization
+    try:
+        connection.request(method, path, headers=headers)
+        response = connection.getresponse()
+        body = response.read()
+        assert response.status == status
+        assert b"test-token" not in body
+        if status == 401:
+            assert response.getheader("WWW-Authenticate") == "Bearer"
+            assert response.getheader("Content-Type") == "application/json"
+            assert json.loads(body) == {"error": "unauthorized"}
+            assert not state.scanRequested.is_set()
+        elif path == "/api/ask/status":
+            assert json.loads(body) == {"configured": False, "model": ""}
+        elif path == "/api/scan":
+            assert json.loads(body) == {"ok": True}
+            assert state.scanRequested.is_set()
+    finally:
+        connection.close()
         server.shutdown()
         server.server_close()

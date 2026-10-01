@@ -45,7 +45,19 @@ python -m analyzer run --music /music --data /data --out /out --workers 2 --inte
 
 浏览器打开 `http://<NAS 局域网 IP>:8790/` 是分析台；`http://<NAS 局域网 IP>:8790/xiyue-taste-v1.json.gz` 是汐乐 App 使用的文件。
 
-文件响应保留 `Content-Encoding: gzip`、`Content-Type: application/json` 和 `Last-Modified`，支持 `If-Modified-Since`，文件没变时返回 304。没有登录验证，任何能打开页面的人都能点「立即扫描」，不要把这个端口映射到公网。
+文件响应保留 `Content-Encoding: gzip`、`Content-Type: application/json` 和 `Last-Modified`，支持 `If-Modified-Since`，文件没变时返回 304。所有 `/api/` 接口和 `.json.gz` 下载需要通过下面的访问检查；面板网页本身不含曲库数据，可以直接打开。
+
+## 访问口令和外网连接
+
+在 Compose 同目录的 `.env` 中设置：
+
+- `TASTE_ACCESS_TOKEN`：访问口令，建议用 `openssl rand -hex 24` 生成；不要写进代码、日志或提交到 Git。
+- `TASTE_TRUSTED_NETWORK`：家里的局域网网段，默认 `192.168.50.0/24`。填写无效网段时，容器启动会报 `bad TASTE_TRUSTED_NETWORK` 并退出。
+- `TASTE_HOST_IP`：NAS 自己的局域网 IP，默认 `192.168.50.2`。
+
+只有来源在信任网段内、地址最后一段不是 `1`、不是 NAS 自己，且不带 `X-Forwarded-For`、`X-Real-IP`、`Forwarded` 请求头的直连请求，才免口令。其他请求必须带 `Authorization: Bearer <访问口令>`；没有配置口令时，也只允许上述局域网直连。
+
+外网反向代理必须用 HTTPS。浏览器首次访问外网面板时，在页面顶部填写“访问口令”并保存，口令保存在这个浏览器的 `localStorage` 中。App 在“设置 → 曲库管家 → AI 助手”里填写同一个口令。
 
 ## 说一句找歌
 
