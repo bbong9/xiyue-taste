@@ -2,10 +2,10 @@
 
 一个容器 `xiyue-taste` 同时运行曲库分析和网页分析台：只读扫描音乐目录，将音频特征、标签、歌词语种和每首歌最相近的 20 首写入 `xiyue-taste-v1.json.gz`，在局域网提供分析状态、曲库画像、曲目详情及 App 结果下载。曲库分析不调用外部 API，不修改音乐文件或标签。
 
-## 在飞牛 NAS 部署
+## 在 NAS 上部署
 
-1. 在飞牛安装并启动 Docker，将整个 `taste-analyzer` 目录放到 NAS，例如 `/vol1/1000/docker/taste-analyzer`。
-2. 打开飞牛终端或 SSH，进入该目录。把下面的音乐目录和输出目录改成自己的真实绝对路径：
+1. 在 NAS 上安装并启动 Docker（飞牛、群晖、极空间等能跑容器的都行），将整个 `taste-analyzer` 目录放到 NAS，例如 `/vol1/1000/docker/taste-analyzer`。
+2. 打开 NAS 的终端或 SSH，进入该目录。把下面的音乐目录和输出目录改成自己的真实绝对路径：
 
    ```bash
    cd /vol1/1000/docker/taste-analyzer
@@ -85,7 +85,7 @@ Compose 从同目录的 `.env` 读取以下环境变量并传给容器：
 
 两接口共用“说一句找歌”的三个环境变量，会把歌名、歌手、专辑、文件路径发给模型服务商。容器只给建议，不修改任何文件。
 
-## 代下载
+## 下载
 
 在 `.env` 中用 `DOWNLOAD_DIR` 指定存歌目录，不填默认使用本目录下的 `downloads/`；下载及歌词、封面只写入这里，`/music` 仍只读。
 `POST /api/downloads`：必填 `url`、`filename`，可选 `directory`、`userAgent`、`referer`、`lyrics`、`cover`（base64），返回 `{"id":"任务编号"}`。
@@ -93,7 +93,7 @@ Compose 从同目录的 `.env` 读取以下环境变量并传给容器：
 文件扩展名按真实音频格式确定，任务信息会返回 `format`、`durationMs`、`sampleRate`、`bitDepth`、`bitRate`。
 `GET /api/downloads` 返回 `{"available":true,"jobs":[]}`，任务中不返回下载地址；`POST /api/downloads/cancel` 接收 `{"id":"任务编号"}`。
 `POST /api/downloads/locate` 接收 `{"name":"标记文件名"}`：手机先经自己的连接在 App 目标文件夹放入 `.xiyue-probe-<32位十六进制>` 文件，容器返回 `{"directory":"子文件夹"}`，根目录返回空字符串，找不到返回 404，用于确认双方指向同一文件夹。
-重名时保留两份，第二份命名为 `名字 (2).flac`；代下载只连接公网地址。
+重名时保留两份，第二份命名为 `名字 (2).flac`；下载只连接公网地址。
 
 ## 从旧版本升级
 
