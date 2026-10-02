@@ -344,9 +344,12 @@
       <div class="actions">
         <span class="status" id="status"><i></i><span id="status-text">连接中</span></span>
         <button class="scan quiet" id="ai-open" type="button">AI 设置</button>
+        <button class="scan quiet" id="access-open" type="button">连接设置</button>
         <button class="scan" id="scan" type="button">立即扫描</button>
       </div>
     </header>
+
+    <p class="ai-result" id="access-notice" role="button" tabindex="0" hidden>还没完成连接设置：点这里填一下，手机在外面才能连上。</p>
 
     <section class="hero">
       <p class="eyebrow">你的常听</p>
@@ -447,7 +450,30 @@
       </div>
     </form>
     <p class="ai-result" id="ai-result" role="status" hidden></p>
-    <p class="ai-note">密钥只存在这台 NAS 上，保存后不会再显示。这里保存的设置优先于 .env 里的。</p>
+    <p class="ai-note">密钥只存在这台 NAS 上，保存后不会再显示。保存后一直有效，重装容器也不丢（存在 data 文件夹里）。</p>
+  </aside>
+  <aside class="drawer" id="access-drawer" role="dialog" aria-modal="true" aria-labelledby="access-title" aria-hidden="true">
+    <button class="close" id="access-close" type="button" aria-label="关闭"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m3.5 3.5 9 9m0-9-9 9" stroke-linecap="round"/></svg></button>
+    <h2 class="d-title" id="access-title">连接设置</h2>
+    <p class="d-sub" id="access-state">正在读取…</p>
+    <form id="access-form">
+      <label class="field"><span>NAS 内网 IP</span>
+        <input id="access-host" type="text" autocomplete="off" spellcheck="false" required disabled>
+      </label>
+      <label class="field"><span>家里网段</span>
+        <input id="access-network" type="text" autocomplete="off" spellcheck="false" required disabled>
+      </label>
+      <label class="field"><span>访问口令</span>
+        <input id="access-key" type="text" placeholder="留空则不修改" autocomplete="off" spellcheck="false" disabled>
+      </label>
+      <div class="ai-actions">
+        <button class="scan quiet" id="access-generate" type="button" disabled>生成一个</button>
+        <button class="scan" id="access-save" type="submit" disabled>保存</button>
+      </div>
+    </form>
+    <p class="ai-result" id="access-result" role="status" hidden></p>
+    <p class="ai-note">口令保存后不会再显示。先把它复制到 App 的 设置 → AI 助手 → 访问口令，再点保存。</p>
+    <p class="ai-note">在家不用口令；在外面要给 8790 端口做一个 https 外网地址，并在 App 里填上它和口令。</p>
   </aside>
 
   <script>
@@ -870,7 +896,7 @@
       $("drawer").classList.remove("open");
       $("drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
-      setTimeout(() => { if (!$("drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open")) $("scrim").hidden = true; }, 300);
+      setTimeout(() => { if (!$("drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("access-drawer").classList.contains("open")) $("scrim").hidden = true; }, 300);
       selected = null;
       highlight();
       previousFocus?.focus({ preventScroll: true });
@@ -887,6 +913,7 @@
     }
     async function openAI() {
       if ($("drawer").classList.contains("open")) closeDetail();
+      if ($("access-drawer").classList.contains("open")) closeAccess();
       aiFocus = document.activeElement;
       aiResult("");
       $("ai-key").value = "";
@@ -908,7 +935,7 @@
       $("ai-drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
       setTimeout(() => {
-        if (!$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open")) $("scrim").hidden = true;
+        if (!$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open") && !$("access-drawer").classList.contains("open")) $("scrim").hidden = true;
       }, 300);
       aiFocus?.focus({ preventScroll: true });
     }
@@ -958,6 +985,101 @@
     $("ai-form").addEventListener("submit", event => { event.preventDefault(); submitAI(true); });
     $("ai-save").addEventListener("click", () => submitAI(false));
 
+    let accessFocus = null;
+    let accessHome = false;
+    let accessNetworkEdited = false;
+    function accessResult(text, kind) {
+      $("access-result").hidden = !text;
+      $("access-result").className = "ai-result" + (kind ? " " + kind : "");
+      $("access-result").textContent = text || "";
+    }
+    function accessState(status) {
+      $("access-state").textContent = status.configured ? `已设置 · 口令${status.tokenSet ? "已设" : "未设"}` : "还没设置";
+      $("access-notice").hidden = status.configured;
+      accessHome = status.home;
+      $("access-form").querySelectorAll("input, button").forEach(node => { node.disabled = !accessHome; });
+      if (!accessHome) accessResult("只能在家里的网络下修改", "bad");
+    }
+    function privateIPv4(value) {
+      if (!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(value)) return false;
+      const parts = value.split(".").map(Number);
+      return parts.every(part => part <= 255) && (
+        parts[0] === 10 || parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31
+        || parts[0] === 192 && parts[1] === 168
+      );
+    }
+    function suggestedNetwork(host) {
+      return privateIPv4(host) ? host.split(".").slice(0, 3).join(".") + ".0/24" : "";
+    }
+    async function loadAccess() {
+      const status = await api("/api/access");
+      const host = status.hostIP || (!status.configured && privateIPv4(location.hostname) ? location.hostname : "");
+      $("access-host").value = host;
+      $("access-network").value = status.network || (!status.configured ? suggestedNetwork(host) : "");
+      accessNetworkEdited = status.configured;
+      accessState(status);
+    }
+    async function openAccess() {
+      if ($("drawer").classList.contains("open")) closeDetail();
+      if ($("ai-drawer").classList.contains("open")) closeAI();
+      accessFocus = document.activeElement;
+      accessResult("");
+      $("access-key").value = "";
+      $("scrim").hidden = false;
+      requestAnimationFrame(() => $("scrim").classList.add("show"));
+      $("access-drawer").classList.add("open");
+      $("access-drawer").setAttribute("aria-hidden", "false");
+      try {
+        await loadAccess();
+      } catch {
+        $("access-state").textContent = "读不到设置";
+      }
+    }
+    function closeAccess() {
+      $("access-drawer").classList.remove("open");
+      $("access-drawer").setAttribute("aria-hidden", "true");
+      $("scrim").classList.remove("show");
+      setTimeout(() => {
+        if (!$("access-drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open")) $("scrim").hidden = true;
+      }, 300);
+      accessFocus?.focus({ preventScroll: true });
+    }
+    $("access-open").addEventListener("click", openAccess);
+    $("access-close").addEventListener("click", closeAccess);
+    $("access-notice").addEventListener("click", openAccess);
+    $("access-notice").addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openAccess(); }
+    });
+    $("access-network").addEventListener("input", () => { accessNetworkEdited = true; });
+    $("access-host").addEventListener("input", () => {
+      if (!accessNetworkEdited) $("access-network").value = suggestedNetwork($("access-host").value.trim());
+    });
+    $("access-generate").addEventListener("click", () => {
+      const bytes = crypto.getRandomValues(new Uint8Array(24));
+      $("access-key").value = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+    });
+    $("access-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      if (!$("access-form").reportValidity()) return;
+      const body = { hostIP: $("access-host").value.trim(), network: $("access-network").value.trim() };
+      if ($("access-key").value) body.token = $("access-key").value;
+      $("access-save").disabled = true;
+      accessResult("正在保存…");
+      try {
+        const status = await api("/api/access", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        });
+        $("access-key").value = "";
+        accessNetworkEdited = true;
+        accessState(status);
+        if (accessHome) accessResult("已保存", "good");
+      } catch (error) {
+        accessResult(error.message === "400" ? "填的内容不对，检查 IP 和网段" : error.message === "403" ? "只能在家里的网络下修改" : "保存失败", "bad");
+      } finally {
+        $("access-save").disabled = !accessHome;
+      }
+    });
+
     $("access-token-form").addEventListener("submit", async event => {
       event.preventDefault();
       try {
@@ -990,9 +1112,14 @@
     $("failures").addEventListener("toggle", () => { if ($("failures").open) loadFailures().catch(() => offline(true)); });
     $("d-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", () => {
-      if ($("ai-drawer").classList.contains("open")) closeAI(); else closeDetail();
+      if ($("access-drawer").classList.contains("open")) closeAccess();
+      else if ($("ai-drawer").classList.contains("open")) closeAI(); else closeDetail();
     });
     document.addEventListener("keydown", event => {
+      if ($("access-drawer").classList.contains("open")) {
+        if (event.key === "Escape") closeAccess();
+        return;
+      }
       if ($("ai-drawer").classList.contains("open")) {
         if (event.key === "Escape") closeAI();
         return;
@@ -1012,6 +1139,7 @@
       resizeTimer = setTimeout(() => { drawSky(); renderMap(); }, 150);
     });
     drawSky();
+    loadAccess().catch(() => { $("access-state").textContent = "读不到设置"; });
     pollStatus();
   </script>
 </body>

@@ -1,28 +1,27 @@
-# 直接拉取 Docker Hub 上的镜像运行，不需要源码。
-# 同目录放一个 .env，填写：
-#   MUSIC_DIR=/你的音乐目录
-#   OUT_DIR=/分析结果输出目录
-#   DOWNLOAD_DIR=/下载的歌存到哪个目录（不填就存到本目录下的 downloads/）
-#   TASTE_LLM_API_KEY=硅基流动密钥（不填则“说一句找歌”不可用）
+# 汐乐容器（懂你 + NAS 下载）。任何能跑 Docker 的 NAS 都能用。
+#
+# 只需要改下面一行：把 /volume1/music 换成你的音乐库在 NAS 上的真实路径。
+# 然后在本文件所在的文件夹（文件夹名用英文）执行：
+#   docker compose pull && docker compose up -d
+# 再用浏览器打开 http://NAS的内网IP:8790 ，按面板上的提示填“连接设置”和“AI 设置”。
+# 以后更新，还是上面那条命令。
+x-music: &music /volume1/music
+
 services:
   taste:
     container_name: xiyue-taste
     image: bbong9/xiyue-taste:latest
     pull_policy: always
-    environment:
-      TASTE_LLM_API_KEY: "${TASTE_LLM_API_KEY:-}"
-      TASTE_LLM_BASE_URL: "${TASTE_LLM_BASE_URL:-https://api.siliconflow.cn/v1}"
-      TASTE_LLM_MODEL: "${TASTE_LLM_MODEL:-deepseek-ai/DeepSeek-V3.2}"
-      TASTE_ACCESS_TOKEN: "${TASTE_ACCESS_TOKEN:-}"
-      TASTE_TRUSTED_NETWORK: "${TASTE_TRUSTED_NETWORK:-192.168.50.0/24}"
-      TASTE_HOST_IP: "${TASTE_HOST_IP:-192.168.50.2}"
     volumes:
-      - "${MUSIC_DIR}:/music:ro"
-      - "./data:/data"
-      - "${OUT_DIR}:/out"
-      - "${DOWNLOAD_DIR:-./downloads}:/downloads"
+      # 音乐库：只读，用来分析
+      - { type: bind, source: *music, target: /music, read_only: true }
+      # 同一个音乐库：可写，App 让 NAS 下的歌存进来（只新增，不改不删已有的歌）
+      - { type: bind, source: *music, target: /downloads }
+      # 容器自己的设置和分析结果，放在本文件夹下
+      - ./data:/data
+      - ./out:/out
     ports:
-      - "0.0.0.0:8790:8790"
+      - "8790:8790"
     cpus: "2.0"
     mem_limit: 2g
     restart: unless-stopped

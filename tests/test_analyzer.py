@@ -23,6 +23,7 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analyzer import ANALYZER_VERSION
+from analyzer.access import AccessError, AccessSettings
 from analyzer.ask import Asker, AskError
 from analyzer.features import extract_features
 from analyzer.output import write_output
@@ -686,8 +687,7 @@ def test_access_trust_requires_direct_home_client(address, forwarded_header, tru
     from analyzer.serve import _Handler
 
     handler = object.__new__(_Handler)
-    handler._trusted_network = ipaddress.ip_network("192.168.50.0/24")
-    handler._host_ip = "192.168.50.2"
+    handler._access = AccessSettings(None, network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2")
     handler.client_address = (address, 12345)
     handler.headers = Message()
     if forwarded_header:
@@ -714,7 +714,9 @@ def test_access_http_requires_token_outside_trusted_network(
     state = PanelState()
     server = make_server(
         tmp_path, 0, data=tmp_path, state=state, index=_AskIndex(),
-        access_token=token, trusted_network=ipaddress.ip_network("192.168.50.0/24"),
+        access=AccessSettings(
+            None, token=token, network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2",
+        ),
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
@@ -1180,3 +1182,153 @@ def test_download_refuses_a_song_cut_short_and_leaves_nothing(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize(("address", "headers", "trusted"), [
+    ("192.168.1.50", {"Host": "192.168.1.2:8790"}, True),
+    ("192.168.1.50", {"Host": "music.example.com"}, False),
+    ("192.168.1.50", {"Host": "192.168.1.2:8790", "X-Forwarded-For": "192.168.1.50"}, False),
+    ("192.168.1.1", {"Host": "192.168.1.2:8790"}, False),
+    ("8.8.8.8", {"Host": "192.168.1.2:8790"}, False),
+])
+def test_access_unconfigured_trust_requires_private_ip_and_host(address, headers, trusted):
+    settings = AccessSettings(None)
+    assert settings.status()["configured"] is False
+    assert settings.trusted(address, headers) is trusted
+
+
+def test_access_saved_network_excludes_nas_and_authorizes_outside_with_token(tmp_path):
+    settings = AccessSettings(tmp_path / "access-settings.json")
+    settings.update("192.168.1.2", "192.168.1.0/24", "a" * 32)
+    assert settings.trusted("192.168.1.50", {}) is True
+    assert settings.trusted("192.168.1.2", {}) is False
+    assert settings.trusted("192.168.2.50", {}) is False
+    assert settings.authorized("192.168.2.50", {"Authorization": "Bearer " + "a" * 32}) is True
+    assert settings.authorized("192.168.2.50", {"Authorization": "Bearer " + "b" * 32}) is False
+
+
+@pytest.mark.parametrize(("host_ip", "network", "token"), [
+    ("8.8.8.8", "8.8.8.0/24", "b" * 32),
+    ("192.168.1.2", "192.168.2.0/24", "b" * 32),
+    ("10.0.0.2", "10.0.0.0/8", "b" * 32),
+    ("192.168.1.2", "192.168.1.0/24", "b" * 8),
+    ("192.168.1.2", "192.168.1.0/24", "bbbbbbbb bbbbbbbb"),
+])
+def test_access_invalid_update_changes_nothing(tmp_path, host_ip, network, token):
+    path = tmp_path / "access-settings.json"
+    settings = AccessSettings(path)
+    settings.update("192.168.1.2", "192.168.1.0/24", "a" * 32)
+    before = settings.status()
+    saved = path.read_bytes()
+    with pytest.raises(AccessError):
+        settings.update(host_ip, network, token)
+    assert settings.status() == before
+    assert path.read_bytes() == saved
+    assert settings.token_matches({"Authorization": "Bearer " + "a" * 32}) is True
+
+
+def test_access_empty_token_keeps_secret_and_private_file(tmp_path):
+    path = tmp_path / "access-settings.json"
+    settings = AccessSettings(path)
+    settings.update("192.168.1.2", "192.168.1.0/24", "  " + "a" * 32 + "  ")
+    for token in ("", None):
+        settings.update("192.168.1.2", "192.168.1.0/24", token)
+        assert settings.token_matches({"Authorization": "Bearer " + "a" * 32}) is True
+    status = settings.status()
+    assert status == {
+        "configured": True, "tokenSet": True, "network": "192.168.1.0/24", "hostIP": "192.168.1.2",
+    }
+    assert "a" * 32 not in json.dumps(status)
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_access_saved_values_survive_restart_and_override_environment(tmp_path):
+    import ipaddress
+
+    path = tmp_path / "access-settings.json"
+    settings = AccessSettings(path)
+    settings.update("192.168.1.2", "192.168.1.2/24", "a" * 32)
+    for again in (
+        AccessSettings(path),
+        AccessSettings(path, token="b" * 32, network=ipaddress.ip_network("10.0.0.0/24"), host_ip="10.0.0.2"),
+    ):
+        assert again.status() == settings.status()
+        assert again.token_matches({"Authorization": "Bearer " + "a" * 32}) is True
+        assert again.token_matches({"Authorization": "Bearer " + "b" * 32}) is False
+
+
+def test_connection_settings_http_reads_saves_and_rejects_bad_values(tmp_path):
+    access = AccessSettings(tmp_path / "access-settings.json")
+    server = make_server(
+        tmp_path, 0, data=tmp_path, state=PanelState(), index=_AskIndex(), access=access,
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/api/access"
+    try:
+        with urllib.request.urlopen(base) as response:
+            assert json.load(response) == {
+                "configured": False, "tokenSet": False, "network": "", "hostIP": "", "home": True,
+            }
+        body = {"hostIP": "192.168.1.2", "network": "192.168.1.0/24", "token": "a" * 32}
+        request = urllib.request.Request(
+            base, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = response.read()
+            assert b"a" * 32 not in payload
+            assert json.loads(payload) == {**access.status(), "home": True}
+        with urllib.request.urlopen(base) as response:
+            payload = response.read()
+            assert b"a" * 32 not in payload
+            assert json.loads(payload) == {**access.status(), "home": True}
+        before = access.status()
+        for payload in (b"{", json.dumps({**body, "hostIP": "8.8.8.8"}).encode("utf-8")):
+            with pytest.raises(urllib.error.HTTPError) as failure:
+                urllib.request.urlopen(urllib.request.Request(
+                    base, data=payload, headers={"Content-Type": "application/json"},
+                ))
+            assert failure.value.code == 400
+            assert json.load(failure.value) == {"error": "bad_request"}
+            assert access.status() == before
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_access_http_connection_settings_requires_home_even_with_token(tmp_path):
+    access = AccessSettings(tmp_path / "access-settings.json")
+    access.update("192.168.1.2", "192.168.1.0/24", "a" * 32)
+    before = access.status()
+    saved = (tmp_path / "access-settings.json").read_bytes()
+    server = make_server(
+        tmp_path, 0, data=tmp_path, state=PanelState(), index=_AskIndex(), access=access,
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/api/access"
+    headers = {"Authorization": "Bearer " + "a" * 32, "X-Forwarded-For": "192.168.1.50"}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(base, headers=headers)) as response:
+            payload = response.read()
+            assert b"a" * 32 not in payload
+            assert json.loads(payload) == {**before, "home": False}
+        body = {"hostIP": "192.168.2.2", "network": "192.168.2.0/24", "token": "b" * 32}
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            urllib.request.urlopen(urllib.request.Request(
+                base, data=json.dumps(body).encode("utf-8"),
+                headers={**headers, "Content-Type": "application/json"},
+            ))
+        assert failure.value.code == 403
+        assert json.load(failure.value) == {"error": "home_only"}
+        assert access.status() == before
+        assert (tmp_path / "access-settings.json").read_bytes() == saved
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_access_memory_settings_do_not_write_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = AccessSettings(None)
+    settings.update("192.168.1.2", "192.168.1.0/24", "a" * 32)
+    assert settings.status()["configured"] is True
+    assert list(tmp_path.iterdir()) == []

@@ -1,12 +1,12 @@
 import argparse
 import functools
-import hmac
 import http.server
 import ipaddress
 import json
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .access import AccessError, AccessSettings
 from .ask import ASK_PARTS, AskError
 from .downloads import DownloadError
 from .settings import SettingsError
@@ -17,8 +17,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def __init__(
         self, *args, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-        access_token="", trusted_network=ipaddress.ip_network("192.168.50.0/24"),
-        host_ip="192.168.50.2", **kwargs,
+        access=None, **kwargs,
     ):
         self._data = data
         self._state = state
@@ -27,9 +26,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self._butler = butler
         self._llm = llm
         self._downloads = downloads
-        self._access_token = access_token
-        self._trusted_network = trusted_network
-        self._host_ip = host_ip
+        self._access = access
         super().__init__(*args, **kwargs)
 
     def send_response(self, code, message=None):
@@ -53,21 +50,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         return self._data is not None and self._state is not None and self._index is not None
 
     def _is_trusted(self) -> bool:
-        address = ipaddress.ip_address(self.client_address[0])
-        return (
-            address in self._trusted_network
-            and str(address).rsplit(".", 1)[-1] != "1"
-            and str(address) != self._host_ip
-            and not any(header in self.headers for header in ("X-Forwarded-For", "X-Real-IP", "Forwarded"))
-        )
+        return self._access.trusted(self.client_address[0], self.headers)
 
     def _authorized(self) -> bool:
-        if self._is_trusted():
-            return True
-        return bool(self._access_token) and hmac.compare_digest(
-            self.headers.get("Authorization", "").encode("utf-8"),
-            ("Bearer " + self._access_token).encode("utf-8"),
-        )
+        return self._is_trusted() or self._access.token_matches(self.headers)
 
     def _send_json(self, value, status=200):
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -128,7 +114,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_json({"error": "not_found"}, 404)
                 return
             query = parse_qs(url.query, keep_blank_values=True)
-            if url.path == "/api/status":
+            if url.path == "/api/access":
+                self._send_json({**self._access.status(), "home": self._is_trusted()})
+            elif url.path == "/api/status":
                 self._send_json({
                     **self._state.snapshot(),
                     "trackCount": len(self._index.load()),
@@ -173,7 +161,20 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         if path.startswith("/api/"):
-            if path == "/api/scan" and self._panel_available():
+            if path == "/api/access":
+                if not self._is_trusted():
+                    self._send_json({"error": "home_only"}, 403)
+                    return
+                body = self._read_json(4096)
+                if body is None:
+                    return
+                try:
+                    self._access.update(body.get("hostIP"), body.get("network"), body.get("token"))
+                except AccessError:
+                    self._send_json({"error": "bad_request"}, 400)
+                    return
+                self._send_json({**self._access.status(), "home": self._is_trusted()})
+            elif path == "/api/scan" and self._panel_available():
                 self._state.request_scan()
                 self._send_json({"ok": True})
             elif path in ("/api/downloads", "/api/downloads/cancel", "/api/downloads/locate"):
@@ -273,12 +274,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
 def make_server(
     out, port, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-    access_token="", trusted_network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2",
+    access=None,
 ):
+    if access is None:
+        access = AccessSettings(None, network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2")
     handler = functools.partial(
         _Handler, directory=str(out), data=data, state=state, index=index, asker=asker, butler=butler, llm=llm,
         downloads=downloads,
-        access_token=access_token, trusted_network=trusted_network, host_ip=host_ip,
+        access=access,
     )
     return http.server.ThreadingHTTPServer(("", port), handler)
 

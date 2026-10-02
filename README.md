@@ -4,26 +4,20 @@
 
 ## 在 NAS 上部署
 
-1. 在 NAS 上安装并启动 Docker（飞牛、群晖、极空间等能跑容器的都行），将整个 `taste-analyzer` 目录放到 NAS，例如 `/vol1/1000/docker/taste-analyzer`。
-2. 打开 NAS 的终端或 SSH，进入该目录。把下面的音乐目录和输出目录改成自己的真实绝对路径：
+1. 在 NAS 上安装并启动 Docker（飞牛、群晖、极空间等能跑容器的都行）。只需要 `docker-compose.hub.yml` 一个文件，把它放进一个英文名文件夹，例如 `taste-analyzer`，不用准备源码或 `.env`。
+2. 打开这个文件，只改 `x-music: &music /volume1/music` 这一行，把 `/volume1/music` 换成音乐库在 NAS 上的真实路径。
+3. 在文件所在目录执行：
 
    ```bash
-   cd /vol1/1000/docker/taste-analyzer
-   export MUSIC_DIR='/vol1/1000/Music'
-   export OUT_DIR='/vol1/1000/xiyue-taste'
-   mkdir -p data "$OUT_DIR"
-   docker compose up -d --build
+   docker compose -f docker-compose.hub.yml pull
+   docker compose -f docker-compose.hub.yml up -d
    ```
 
-3. 在同一个终端查看运行情况：
+4. 用浏览器直接打开 `http://NAS的内网IP:8790`，按面板提示填写“连接设置”和“AI 设置”。以后更新也执行上面两条命令。
 
-   ```bash
-   docker compose logs -f taste
-   ```
+音乐库以只读方式挂载到 `/music` 用于分析，同一音乐库也挂载到 `/downloads` 接收 App 交给 NAS 下载的歌。设置和缓存保存在本目录的 `data/`，分析结果保存在 `out/`；重装容器时保留这两个目录。容器使用 2 个分析进程，限制为 2 CPU、2 GB 内存。启动后扫描一次，随后每隔 24 小时再扫描。
 
-音乐目录挂载到 `/music:ro`；缓存保存在本目录的 `data/cache.sqlite`；输出保存在 `$OUT_DIR/xiyue-taste-v1.json.gz`。容器使用 2 个分析进程，限制为 2 CPU、2 GB 内存。启动后扫描一次，随后每隔 24 小时再扫描。
-
-重新打开终端执行 Compose 命令时，需要先重新设置上述 `MUSIC_DIR` 和 `OUT_DIR`。NAS 上的 Docker 需要有音乐目录的读取权限，以及缓存目录、输出目录的写入权限。
+也可以用环境变量（老办法）：`TASTE_ACCESS_TOKEN`、`TASTE_TRUSTED_NETWORK`、`TASTE_HOST_IP`、`TASTE_LLM_API_KEY`、`TASTE_LLM_BASE_URL`、`TASTE_LLM_MODEL`。原有部署方式仍可用，面板保存的设置优先于环境变量。
 
 ## 手动扫描一次
 

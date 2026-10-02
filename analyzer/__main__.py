@@ -4,6 +4,7 @@ import os
 import threading
 import time
 
+from .access import AccessSettings
 from .ask import Asker
 from .butler import Butler
 from .downloads import Downloads
@@ -35,14 +36,16 @@ def main():
     args = parser.parse_args()
 
     if args.command == "run":
-        access_token = os.environ.get("TASTE_ACCESS_TOKEN", "")
+        network = os.environ.get("TASTE_TRUSTED_NETWORK")
+        host_ip = os.environ.get("TASTE_HOST_IP", "")
         try:
-            trusted_network = ipaddress.ip_network(
-                os.environ.get("TASTE_TRUSTED_NETWORK", "192.168.50.0/24"), strict=False
-            )
+            network = ipaddress.ip_network(network, strict=False) if network else None
         except ValueError:
             raise SystemExit("bad TASTE_TRUSTED_NETWORK")
-        host_ip = os.environ.get("TASTE_HOST_IP", "192.168.50.2")
+        access = AccessSettings(
+            os.path.join(args.data, "access-settings.json"),
+            token=os.environ.get("TASTE_ACCESS_TOKEN", ""), network=network, host_ip=host_ip,
+        )
         os.nice(15)
         state = PanelState()
         index = OutputIndex(args.out)
@@ -57,7 +60,7 @@ def main():
         server = make_server(
             args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler, llm=llm,
             downloads=Downloads(args.downloads),
-            access_token=access_token, trusted_network=trusted_network, host_ip=host_ip,
+            access=access,
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
         print(f"Serving on port {args.port}.", flush=True)
