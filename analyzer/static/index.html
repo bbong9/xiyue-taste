@@ -61,7 +61,7 @@
       background-attachment: fixed;
       overflow-x: hidden;
     }
-    button, input { font: inherit; color: inherit; }
+    button, input, select { font: inherit; color: inherit; }
     button { cursor: pointer; }
 
     #sky { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }
@@ -266,13 +266,14 @@
     .metric-label { color: var(--muted); font-size: 12px; letter-spacing: .2em; }
     .field { display: block; margin-top: 20px; }
     .field span { display: block; margin-bottom: 8px; color: var(--muted); font-size: 12px; letter-spacing: .2em; }
-    .field input {
+    .field input, .field select {
       width: 100%; height: 42px; padding: 0 14px; border-radius: 12px; outline: none;
       border: 1px solid var(--line); background: var(--panel); font-size: 14px;
       transition: border-color .2s, box-shadow .2s;
     }
     .field input::placeholder { color: var(--faint); }
-    .field input:focus { border-color: color-mix(in srgb, var(--tide) 60%, transparent); box-shadow: 0 0 0 4px var(--tide-soft); }
+    .field input:focus, .field select:focus { border-color: color-mix(in srgb, var(--tide) 60%, transparent); box-shadow: 0 0 0 4px var(--tide-soft); }
+    .field select option { background: var(--night-2); color: var(--text); }
     .ai-actions { display: flex; gap: 12px; margin-top: 26px; }
     .ai-result { white-space: pre-line; margin: 18px 0 0; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); font-size: 13px; line-height: 1.6; word-break: break-word; }
     .ai-result.good { color: var(--sea); border-color: color-mix(in srgb, var(--sea) 40%, transparent); }
@@ -437,6 +438,19 @@
     <h2 class="d-title" id="ai-title">AI 设置</h2>
     <p class="d-sub" id="ai-state">正在读取…</p>
     <form id="ai-form">
+      <label class="field"><span>服务商</span><select id="ai-provider">
+        <option value="">自己填</option>
+        <option value="https://api.siliconflow.cn/v1" data-model="deepseek-ai/DeepSeek-V3">硅基流动</option>
+        <option value="https://api.deepseek.com" data-model="deepseek-flash">DeepSeek</option>
+        <option value="https://dashscope.aliyuncs.com/compatible-mode/v1" data-model="qwen-plus">阿里云百炼（通义）</option>
+        <option value="https://ark.cn-beijing.volces.com/api/v3" data-model="方舟控制台里的模型名或接入点 ID">火山方舟（豆包）</option>
+        <option value="https://open.bigmodel.cn/api/paas/v4" data-model="glm-4-flash">智谱</option>
+        <option value="https://api.moonshot.cn/v1" data-model="moonshot-v1-8k">月之暗面 Kimi</option>
+        <option value="https://api.hunyuan.cloud.tencent.com/v1" data-model="hunyuan-turbos-latest">腾讯混元</option>
+        <option value="https://api.openai.com/v1" data-model="gpt-4o-mini">OpenAI</option>
+        <option value="https://generativelanguage.googleapis.com/v1beta/openai" data-model="gemini-2.5-flash">Gemini</option>
+        <option value="https://openrouter.ai/api/v1" data-model="deepseek/deepseek-chat">OpenRouter</option>
+      </select></label>
       <label class="field"><span>接口地址</span>
         <input id="ai-base" type="url" placeholder="https://api.siliconflow.cn/v1" autocomplete="off" spellcheck="false" required>
       </label>
@@ -452,7 +466,7 @@
       </div>
     </form>
     <p class="ai-result" id="ai-result" role="status" hidden></p>
-    <p class="ai-note">密钥只存在这台 NAS 上，保存后不会再显示。保存后一直有效，重装容器也不丢（存在 data 文件夹里）。</p>
+    <p class="ai-note">密钥只存在这台 NAS 上，保存后不会再显示。保存后一直有效，重装容器也不丢（存在 data 文件夹里）。支持所有 OpenAI 兼容接口。</p>
   </aside>
   <aside class="drawer" id="access-drawer" role="dialog" aria-modal="true" aria-labelledby="access-title" aria-hidden="true">
     <button class="close" id="access-close" type="button" aria-label="关闭"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m3.5 3.5 9 9m0-9-9 9" stroke-linecap="round"/></svg></button>
@@ -924,6 +938,12 @@
     function aiState(status) {
       $("ai-state").textContent = status.configured ? `已配置 · ${status.model}` : "还没填密钥";
     }
+    function syncAIProvider() {
+      const base = $("ai-base").value.trim().replace(/\/+$/, "");
+      const option = Array.from($("ai-provider").options).find(option => option.value && option.value === base);
+      $("ai-provider").value = option ? option.value : "";
+      if (option) $("ai-model").placeholder = option.dataset.model;
+    }
     async function openAI() {
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("access-drawer").classList.contains("open")) closeAccess();
@@ -939,6 +959,7 @@
         const status = await api("/api/llm");
         $("ai-base").value = status.baseURL;
         $("ai-model").value = status.model;
+        syncAIProvider();
         aiState(status);
       } catch (error) {
         $("ai-state").textContent = error.message === "404" ? "这个版本的容器还不支持在这里设置" : "读不到设置";
@@ -983,6 +1004,7 @@
           } else {
             const reasons = {
               unconfigured: "还没填密钥", unreachable: "连不上这个接口地址", bad_answer: "模型有回应，但没按要求的格式回答",
+              truncated: "模型把字数都用在思考上了，没给出回答。换一个不带思考的模型，或在服务商那边关掉思考",
               http_401: "密钥不对（401）", http_403: "没有权限或余额不足（403）", http_404: "地址或模型名不对（404）", http_429: "请求太频繁或额度用完（429）",
             };
             const reason = reasons[result.error] || `模型服务返回 ${result.error.replace("http_", "")}`;
@@ -996,6 +1018,13 @@
     }
     $("ai-open").addEventListener("click", openAI);
     $("ai-close").addEventListener("click", closeAI);
+    $("ai-provider").addEventListener("change", () => {
+      const option = $("ai-provider").selectedOptions[0];
+      if (!option.value) return;
+      $("ai-base").value = option.value;
+      $("ai-model").placeholder = option.dataset.model;
+    });
+    $("ai-base").addEventListener("input", syncAIProvider);
     $("ai-form").addEventListener("submit", event => { event.preventDefault(); submitAI(true); });
     $("ai-save").addEventListener("click", () => submitAI(false));
 

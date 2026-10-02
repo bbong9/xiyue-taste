@@ -1583,3 +1583,213 @@ def test_download_logs_events_without_address_path(tmp_path, caplog):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_tempo_and_onsets_match_librosa():
+    import librosa
+    from analyzer.features import _onset_count, _tempo
+
+    rng = np.random.default_rng(0)
+    seconds = np.arange(SAMPLE_RATE * 20) / SAMPLE_RATE
+    signals = [
+        np.zeros(SAMPLE_RATE * 5, dtype=np.float32),
+        rng.standard_normal(SAMPLE_RATE * 10).astype(np.float32),
+        (np.sin(2 * np.pi * 330 * seconds) * (np.sin(2 * np.pi * 2 * seconds) > 0.9)).astype(np.float32),
+    ]
+    for audio in signals:
+        envelope = librosa.onset.onset_strength(y=audio, sr=SAMPLE_RATE)
+        assert _tempo(envelope, SAMPLE_RATE) == float(np.asarray(
+            librosa.beat.beat_track(onset_envelope=envelope, sr=SAMPLE_RATE)[0]
+        ).item())
+        assert _onset_count(envelope, SAMPLE_RATE) == len(
+            librosa.onset.onset_detect(onset_envelope=envelope, sr=SAMPLE_RATE)
+        )
+
+
+def test_features_do_not_call_beat_tracker(monkeypatch):
+    import librosa
+    from analyzer.features import analyze_audio
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("compiled beat tracker or onset detector called")
+
+    monkeypatch.setattr(librosa.beat, "beat_track", forbidden)
+    monkeypatch.setattr(librosa.onset, "onset_detect", forbidden)
+    audio = np.random.default_rng(0).standard_normal(SAMPLE_RATE * 5).astype(np.float32)
+    vector, bpm, loudness = analyze_audio(audio)
+    assert len(vector) == 53
+    assert all(isinstance(value, float) for value in vector)
+    assert vector[-3] == bpm
+    assert vector[-1] == loudness
+
+
+def test_worker_died_is_retried_once_after_version_change(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import analyzer.scan as scan_module
+
+    monkeypatch.setattr(
+        scan_module, "ProcessPoolExecutor",
+        lambda **kwargs: ThreadPoolExecutor(max_workers=kwargs["max_workers"]),
+    )
+    music = tmp_path / "music"
+    music.mkdir()
+    path = music / "song.wav"
+    path.write_bytes(b"fake audio")
+    data, out = tmp_path / "data", tmp_path / "out"
+    data.mkdir()
+    stat = path.stat()
+    with sqlite3.connect(data / "cache.sqlite") as connection:
+        connection.execute(
+            """CREATE TABLE tracks(
+                path TEXT PRIMARY KEY, size INTEGER, mtime REAL, version TEXT,
+                features TEXT, tags TEXT, error TEXT
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO tracks VALUES (?, ?, ?, ?, NULL, NULL, ?)",
+            ("song.wav", stat.st_size, stat.st_mtime, ANALYZER_VERSION, "WorkerDied"),
+        )
+    version = os.environ.get("TASTE_VERSION", "dev")
+    marker = data / "died-retry-version"
+    marker.write_text(version + "\n", encoding="utf-8")
+    calls = []
+
+    def analyze(path):
+        calls.append(path)
+        return {
+            "vector": [1.0] * 53, "bpm": 120.0, "loudnessLUFS": -15.0, "durationSec": 5.0,
+        }, {
+            "title": "Song", "artists": None, "album": None, "genre": None,
+            "year": None, "lyricsLanguage": None,
+        }
+
+    assert scan(music, data, out, analyze=analyze) == {"analyzed": 0, "tracks": 0}
+    assert calls == []
+    monkeypatch.setenv("TASTE_VERSION", version + "-next")
+    assert scan(music, data, out, analyze=analyze) == {"analyzed": 1, "tracks": 1}
+    assert calls == [str(path)]
+    assert marker.read_text(encoding="utf-8") == version + "-next\n"
+    assert scan(music, data, out, analyze=analyze) == {"analyzed": 0, "tracks": 1}
+    assert calls == [str(path)]
+
+
+def test_llm_disables_thinking_for_known_hosts():
+    from analyzer.llm import chat_json
+
+    for base_url in ("https://api.deepseek.com", "https://example.com/v1"):
+        urlopen, calls = _fake_llm('{"ok": true}')
+        assert chat_json(
+            "test-key", base_url, "test-model", "system", "user", 200, 30, urlopen,
+        ) == {"ok": True}
+        assert len(calls) == 1
+        body = json.loads(calls[0][0].data)
+        if base_url == "https://api.deepseek.com":
+            assert body["thinking"] == {"type": "disabled"}
+        else:
+            assert set(body) == {"model", "messages", "temperature", "max_tokens"}
+
+
+def test_llm_retries_without_extras_after_400():
+    from analyzer.llm import chat_json
+
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append(json.loads(request.data))
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, 400, "bad", {}, io.BytesIO(b'{"error":"unknown field thinking"}'),
+            )
+        return io.BytesIO(b'{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}')
+
+    assert chat_json(
+        "test-key", "https://api.deepseek.com", "test-model", "system", "user", 200, 30, urlopen,
+    ) == {"ok": True}
+    assert len(calls) == 2
+    assert calls[0]["thinking"] == {"type": "disabled"}
+    assert "thinking" not in calls[1]
+    assert calls[1] == {key: value for key, value in calls[0].items() if key != "thinking"}
+
+
+def test_llm_switches_to_max_completion_tokens():
+    from analyzer.llm import chat_json
+
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append(json.loads(request.data))
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, 400, "bad", {},
+                io.BytesIO(b'{"error":"use max_completion_tokens instead"}'),
+            )
+        return io.BytesIO(b'{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}')
+
+    assert chat_json(
+        "test-key", "https://example.com/v1", "test-model", "system", "user", 200, 30, urlopen,
+    ) == {"ok": True}
+    assert len(calls) == 2
+    assert calls[1]["max_completion_tokens"] == 200
+    assert "max_tokens" not in calls[1]
+    assert "temperature" not in calls[1]
+
+
+def test_llm_400_on_plain_host_keeps_detail():
+    from analyzer.llm import chat_json
+
+    calls = []
+    raw = b'{"error":"bad model"}'
+
+    def urlopen(request, timeout):
+        calls.append(request)
+        raise urllib.error.HTTPError(request.full_url, 400, "bad", {}, io.BytesIO(raw))
+
+    with pytest.raises(urllib.error.HTTPError) as failure:
+        chat_json(
+            "test-key", "https://example.com/v1", "test-model", "system", "user", 200, 30, urlopen,
+        )
+    assert failure.value.code == 400
+    assert failure.value.read() == raw
+    assert len(calls) == 1
+
+
+def test_llm_reports_truncated_and_strips_think():
+    from analyzer.llm import Truncated, chat_json
+
+    answers = iter([
+        {"message": {"content": ""}, "finish_reason": "length"},
+        {"message": {"content": '<think>{乱}</think>{"ok": true}'}, "finish_reason": "stop"},
+        {"message": {"content": None}, "finish_reason": "stop"},
+    ])
+
+    def urlopen(request, timeout):
+        return io.BytesIO(json.dumps({"choices": [next(answers)]}).encode("utf-8"))
+
+    def call():
+        return chat_json(
+            "test-key", "https://example.com/v1", "test-model", "system", "user", 200, 30, urlopen,
+        )
+
+    with pytest.raises(Truncated):
+        call()
+    assert call() == {"ok": True}
+    with pytest.raises(ValueError) as failure:
+        call()
+    assert not isinstance(failure.value, Truncated)
+
+
+def test_settings_test_reports_truncated(tmp_path):
+    from analyzer.settings import LLMSettings
+
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append(json.loads(request.data))
+        return io.BytesIO(b'{"choices":[{"message":{"content":""},"finish_reason":"length"}]}')
+
+    settings = LLMSettings(
+        tmp_path / "s.json", "test-key", "https://example.com/v1", "test-model", urlopen=urlopen,
+    )
+    assert settings.test() == {"ok": False, "error": "truncated", "detail": ""}
+    assert len(calls) == 1
+    assert calls[0]["max_tokens"] == 200

@@ -61,9 +61,11 @@ python -m analyzer run --music /music --data /data --out /out --workers 2 --inte
 
 Compose 从同目录的 `.env` 读取以下环境变量并传给容器：
 
-- `TASTE_LLM_API_KEY`：硅基流动密钥，只放在 `.env`，不要写入代码、日志或提交到 Git；不填时接口返回 503。
+- `TASTE_LLM_API_KEY`：模型服务商的密钥，只放在 `.env`，不要写入代码、日志或提交到 Git；不填时接口返回 503。
 - `TASTE_LLM_BASE_URL`：默认 `https://api.siliconflow.cn/v1`。
 - `TASTE_LLM_MODEL`：默认 `deepseek-ai/DeepSeek-V3.2`。
+
+任何 OpenAI 兼容接口都可以，推荐在面板里填。
 
 使用此接口会把查询原文、曲库歌名、歌手、风格、语种、BPM 和响度发给模型服务商。
 

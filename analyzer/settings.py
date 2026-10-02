@@ -6,7 +6,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .llm import chat_json
+from .llm import Truncated, chat_json
+from .log import LOGGER
 
 
 class SettingsError(Exception):
@@ -73,21 +74,30 @@ class LLMSettings:
         with self._lock:
             api_key, base_url, model = self._api_key, self._base_url, self._model
         if not api_key:
+            LOGGER.warning("LLM-TEST %s model=%s", "unconfigured", model)
             return {"ok": False, "error": "unconfigured", "detail": ""}
         began = time.monotonic()
         try:
             chat_json(
                 api_key, base_url, model, '只输出这个 JSON，不要任何其他文字：{"ok": true}', "测试",
-                20, 30, self._urlopen,
+                200, 30, self._urlopen,
             )
         except urllib.error.HTTPError as error:
             try:
                 detail = error.read(400).decode("utf-8", "replace")
             except OSError:
                 detail = ""
+            LOGGER.warning("LLM-TEST %s model=%s", f"http_{error.code}", model)
             return {"ok": False, "error": f"http_{error.code}", "detail": detail.replace(api_key, "***")[:200]}
         except (urllib.error.URLError, OSError):
+            LOGGER.warning("LLM-TEST %s model=%s", "unreachable", model)
             return {"ok": False, "error": "unreachable", "detail": ""}
-        except (ValueError, KeyError, IndexError, TypeError):
+        except Truncated:
+            LOGGER.warning("LLM-TEST %s model=%s", "truncated", model)
+            return {"ok": False, "error": "truncated", "detail": ""}
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            LOGGER.warning("LLM-TEST %s model=%s", "bad_answer", model)
             return {"ok": False, "error": "bad_answer", "detail": ""}
-        return {"ok": True, "ms": round((time.monotonic() - began) * 1000), "model": model}
+        milliseconds = round((time.monotonic() - began) * 1000)
+        LOGGER.info("LLM-TEST ok model=%s ms=%s", model, milliseconds)
+        return {"ok": True, "ms": milliseconds, "model": model}

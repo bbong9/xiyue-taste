@@ -48,6 +48,13 @@ def _exit_hint(code):
 
 
 def _probe():
+    from .features import SAMPLE_RATE, analyze_audio
+    import numpy as np
+
+    seconds = np.arange(SAMPLE_RATE * 5) / SAMPLE_RATE
+    audio = (np.sin(2 * np.pi * 330 * seconds) * (np.sin(2 * np.pi * 2 * seconds) > 0.9)).astype(np.float32)
+    audio += 0.01 * np.random.default_rng(0).standard_normal(len(audio)).astype(np.float32)
+    analyze_audio(audio)
     return "ok"
 
 
@@ -84,6 +91,8 @@ def probe_worker():
                 for process in list((getattr(executor, "_processes", None) or {}).values()):
                     process.terminate()
                 return "timeout"
+            except Exception as exception:
+                return f"failed {type(exception).__name__}: {str(exception)[:200]}"
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
     except Exception as exception:
@@ -101,6 +110,12 @@ def scan(music, data, out, workers=2, progress=None, analyze=None):
     music = Path(music)
     data = Path(data)
     data.mkdir(parents=True, exist_ok=True)
+    version = os.environ.get("TASTE_VERSION", "dev")
+    retry_version_path = data / "died-retry-version"
+    try:
+        retry_died = retry_version_path.read_text(encoding="utf-8").strip() != version
+    except OSError:
+        retry_died = True
     with closing(sqlite3.connect(data / "cache.sqlite")) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute(
@@ -114,6 +129,7 @@ def scan(music, data, out, workers=2, progress=None, analyze=None):
         }
         paths = set()
         pending = []
+        retry_died_count = 0
         for directory, directories, filenames in os.walk(music):
             directories[:] = sorted(name for name in directories if not name.startswith("."))
             for filename in sorted(filenames):
@@ -126,13 +142,21 @@ def scan(music, data, out, workers=2, progress=None, analyze=None):
                 previous = cached.get(relative)
                 if previous is not None and (
                     previous["size"], previous["mtime"], previous["version"]
-                ) == (stat.st_size, stat.st_mtime, ANALYZER_VERSION) and previous["error"] != "BrokenProcessPool":
+                ) == (stat.st_size, stat.st_mtime, ANALYZER_VERSION) and previous["error"] != "BrokenProcessPool" and not (
+                    retry_died and previous["error"] == "WorkerDied"
+                ):
                     continue
                 pending.append((path, relative, stat.st_size, stat.st_mtime))
+                if previous is not None and previous["error"] == "WorkerDied":
+                    retry_died_count += 1
 
         for removed in cached.keys() - paths:
             connection.execute("DELETE FROM tracks WHERE path = ?", (removed,))
-        LOGGER.info("SCAN-START pending=%s cached=%s workers=%s", len(pending), len(cached), workers)
+        retry_version_path.write_text(version + "\n", encoding="utf-8")
+        LOGGER.info(
+            "SCAN-START pending=%s cached=%s workers=%s retry_died=%s",
+            len(pending), len(cached), workers, retry_died_count,
+        )
         if progress is not None:
             progress(0, len(pending))
         done = 0
