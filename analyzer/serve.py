@@ -3,13 +3,39 @@ import functools
 import http.server
 import ipaddress
 import json
+import threading
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from . import log
 from .access import AccessError, AccessSettings
 from .ask import ASK_PARTS, AskError
 from .downloads import DownloadError
+from .log import LOGGER
 from .settings import SettingsError
+
+
+_auth_rejections = {}
+_auth_rejections_lock = threading.Lock()
+
+
+def _log_auth_reject(address, path, headers):
+    now = time.monotonic()
+    with _auth_rejections_lock:
+        previous = _auth_rejections.get(address)
+        if previous is not None and now - previous < 60:
+            return
+        _auth_rejections[address] = now
+        if len(_auth_rejections) > 1000:
+            _auth_rejections.clear()
+            _auth_rejections[address] = now
+    LOGGER.warning(
+        "AUTH-REJECT addr=%s path=%s forwarded=%s token=%s",
+        address, urlsplit(path).path,
+        "是" if any(header in headers for header in ("X-Forwarded-For", "X-Real-IP", "Forwarded")) else "否",
+        "带了" if headers.get("Authorization") else "没带",
+    )
 
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
@@ -56,6 +82,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         return self._is_trusted() or self._access.token_matches(self.headers)
 
     def _send_json(self, value, status=200):
+        if status == 401:
+            _log_auth_reject(self.client_address[0], self.path, self.headers)
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json" if status == 401 else "application/json; charset=utf-8")
@@ -109,6 +137,22 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+        elif url.path in ("/api/logs", "/api/logs/download"):
+            if self._data is None:
+                self._send_json({"error": "not_found"}, 404)
+                return
+            if url.path == "/api/logs":
+                query = parse_qs(url.query, keep_blank_values=True)
+                self._send_json({"lines": log.tail(self._data, self._integer(query, "lines", 300))})
+            else:
+                payload = log.export(self._data)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="xiyue-container.log"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
         elif url.path.startswith("/api/"):
             if not self._panel_available():
                 self._send_json({"error": "not_found"}, 404)
@@ -163,6 +207,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if path.startswith("/api/"):
             if path == "/api/access":
                 if not self._is_trusted():
+                    LOGGER.warning("SETTINGS access rejected addr=%s", self.client_address[0])
                     self._send_json({"error": "home_only"}, 403)
                     return
                 body = self._read_json(4096)
@@ -173,7 +218,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 except AccessError:
                     self._send_json({"error": "bad_request"}, 400)
                     return
-                self._send_json({**self._access.status(), "home": self._is_trusted()})
+                status = self._access.status()
+                LOGGER.info(
+                    "SETTINGS access saved network=%s hostIP=%s token=%s",
+                    status["network"], status["hostIP"], "已设" if status["tokenSet"] else "未设",
+                )
+                self._send_json({**status, "home": self._is_trusted()})
             elif path == "/api/scan" and self._panel_available():
                 self._state.request_scan()
                 self._send_json({"ok": True})
@@ -203,6 +253,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 except SettingsError:
                     self._send_json({"error": "bad_request"}, 400)
                     return
+                LOGGER.info("SETTINGS llm saved model=%s", self._llm.status()["model"])
                 self._send_json(self._llm.status())
             elif path == "/api/llm/test" and self._llm is not None:
                 self._send_json(self._llm.test())

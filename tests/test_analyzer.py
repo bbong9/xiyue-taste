@@ -1332,3 +1332,254 @@ def test_access_memory_settings_do_not_write_files(tmp_path, monkeypatch):
     settings.update("192.168.1.2", "192.168.1.0/24", "a" * 32)
     assert settings.status()["configured"] is True
     assert list(tmp_path.iterdir()) == []
+
+
+def _analyze_or_die(path):
+    if "KILL" in os.path.basename(path):
+        os._exit(1)
+    from analyzer.scan import _analyze
+    return _analyze(path)
+
+
+def test_scan_isolates_worker_death_and_does_not_retry_it(tmp_path):
+    music = tmp_path / "music"
+    music.mkdir()
+    for index in range(4):
+        write_sine(music / f"song-{index}.wav")
+    write_sine(music / "KILL.wav")
+    data, out = tmp_path / "data", tmp_path / "out"
+    updates = []
+    result = scan(
+        music, data, out, workers=2, analyze=_analyze_or_die,
+        progress=lambda done, total: updates.append((done, total)),
+    )
+    assert result == {"analyzed": 5, "tracks": 4}
+    with sqlite3.connect(data / "cache.sqlite") as connection:
+        rows = dict(connection.execute("SELECT path, error FROM tracks"))
+    assert rows == {"KILL.wav": "WorkerDied", **{f"song-{index}.wav": None for index in range(4)}}
+    assert "BrokenProcessPool" not in rows.values()
+    assert updates[-1] == (5, 5)
+    assert scan(music, data, out, workers=2, analyze=_analyze_or_die) == {"analyzed": 0, "tracks": 4}
+
+
+def test_scan_retries_cached_broken_process_pool(tmp_path):
+    music = tmp_path / "music"
+    music.mkdir()
+    for index in range(2):
+        write_sine(music / f"song-{index}.wav")
+    data, out = tmp_path / "data", tmp_path / "out"
+    assert scan(music, data, out, workers=2) == {"analyzed": 2, "tracks": 2}
+    with sqlite3.connect(data / "cache.sqlite") as connection:
+        connection.execute(
+            "UPDATE tracks SET error = ?, features = NULL, tags = NULL WHERE path = ?",
+            ("BrokenProcessPool", "song-0.wav"),
+        )
+        connection.commit()
+    assert scan(music, data, out, workers=2) == {"analyzed": 1, "tracks": 2}
+    with sqlite3.connect(data / "cache.sqlite") as connection:
+        error, features, tags = connection.execute(
+            "SELECT error, features, tags FROM tracks WHERE path = ?", ("song-0.wav",),
+        ).fetchone()
+    assert error is None
+    assert features is not None and tags is not None
+
+
+def test_scan_stops_after_five_consecutive_worker_deaths(tmp_path):
+    from analyzer.scan import WorkersKeepDying
+
+    music = tmp_path / "music"
+    music.mkdir()
+    for index in range(6):
+        write_sine(music / f"KILL-{index}.wav")
+    data, out = tmp_path / "data", tmp_path / "out"
+    with pytest.raises(WorkersKeepDying):
+        scan(music, data, out, workers=2, analyze=_analyze_or_die)
+    with sqlite3.connect(data / "cache.sqlite") as connection:
+        errors = connection.execute("SELECT error FROM tracks").fetchall()
+    assert errors == [("WorkerDied",)] * 5
+
+
+@pytest.fixture
+def container_logger(tmp_path):
+    from analyzer.log import LOGGER, setup
+
+    handlers = list(LOGGER.handlers)
+    level, propagate = LOGGER.level, LOGGER.propagate
+    try:
+        setup(tmp_path)
+        yield LOGGER
+    finally:
+        for handler in list(LOGGER.handlers):
+            if handler not in handlers:
+                LOGGER.removeHandler(handler)
+                handler.close()
+        LOGGER.setLevel(level)
+        LOGGER.propagate = propagate
+
+
+def test_log_setup_writes_once_and_tail_reads_it(tmp_path, container_logger):
+    from analyzer.log import setup, tail
+
+    setup(tmp_path)
+    container_logger.info("hello")
+    text = (tmp_path / "logs" / "container.log").read_text(encoding="utf-8")
+    assert text.count("hello") == 1
+    assert "hello" in tail(tmp_path)[-1]
+
+
+def test_log_tail_limits_lines_and_export_orders_rotations(tmp_path):
+    from analyzer.log import export, tail
+
+    assert tail(tmp_path) == []
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    (directory / "container.log.2").write_bytes(b"old\n")
+    (directory / "container.log.1").write_bytes(b"middle\n")
+    path = directory / "container.log"
+    path.write_bytes(b"a\nb\nc\n")
+    assert tail(tmp_path, 2) == ["b", "c"]
+    assert export(tmp_path) == b"old\nmiddle\na\nb\nc\n"
+    path.write_text("line\n" * 2005)
+    assert len(tail(tmp_path, 9999)) == 2000
+    assert tail(tmp_path, 0) == []
+
+
+def test_log_environment_handles_missing_files_and_cpu_flags(tmp_path):
+    from analyzer.log import environment_lines
+
+    paths = {
+        "cpuinfo": tmp_path / "cpuinfo", "meminfo": tmp_path / "meminfo",
+        "memory_max": tmp_path / "memory.max", "memory_limit": tmp_path / "memory.limit_in_bytes",
+    }
+    assert "未知" in "\n".join(environment_lines(**paths))
+    paths["cpuinfo"].write_text("model name : Test CPU\nflags : fpu sse4_2 avx\n")
+    paths["meminfo"].write_text("MemTotal: 2097152 kB\nMemAvailable: 1048576 kB\n")
+    paths["memory_limit"].write_text("2147483648")
+    text = "\n".join(environment_lines(**paths))
+    assert "avx=有" in text
+    assert "avx2=无" in text
+    assert "sse4_2=有" in text
+    assert "CPU型号=Test CPU" in text
+    assert "MemTotal=2048 MB" in text and "MemAvailable=1024 MB" in text
+    assert "容器内存上限=2048 MB" in text
+    paths["memory_max"].write_text("max")
+    assert "容器内存上限=无限制" in "\n".join(environment_lines(**paths))
+
+
+def test_worker_exit_hints_explain_signals():
+    from analyzer.scan import _exit_hint
+
+    assert "被系统强制结束，多半是内存不够" in _exit_hint(-9)
+    assert "非法指令，处理器不支持分析库要用的指令集" in _exit_hint(-4)
+    assert _exit_hint(0) == ""
+
+
+def test_worker_probe_imports_analysis_libraries():
+    from analyzer.scan import probe_worker
+
+    assert probe_worker() == "ok"
+
+
+def test_scan_logs_pool_failure_and_confirmed_worker_death(tmp_path, caplog):
+    caplog.set_level("INFO", logger="xiyue")
+    music = tmp_path / "music"
+    music.mkdir()
+    write_sine(music / "song.wav")
+    write_sine(music / "KILL.wav")
+    result = scan(music, tmp_path / "data", tmp_path / "out", workers=2, analyze=_analyze_or_die)
+    assert result == {"analyzed": 2, "tracks": 1}
+    messages = [record.getMessage() for record in caplog.records if record.name == "xiyue"]
+    for event in ("SCAN-START", "POOL-BROKEN", "WORKER-DIED", "SCAN-END"):
+        assert any(message.startswith(event) for message in messages)
+    assert any(message.startswith("WORKER-DIED") and "KILL.wav" in message for message in messages)
+
+
+def test_scan_logs_bad_file_and_relative_path(tmp_path, caplog):
+    caplog.set_level("INFO", logger="xiyue")
+    music = tmp_path / "music"
+    (music / "album").mkdir(parents=True)
+    (music / "album" / "broken.flac").write_bytes(b"not an audio file")
+    assert scan(music, tmp_path / "data", tmp_path / "out", workers=2)["tracks"] == 0
+    assert "ANALYZE-FAIL album/broken.flac" in caplog.text
+
+
+def test_access_logs_require_token_and_rate_limit_rejections(tmp_path, caplog, monkeypatch):
+    from analyzer import serve
+
+    caplog.set_level("INFO", logger="xiyue")
+    monkeypatch.setattr(serve, "_auth_rejections", {})
+    server = make_server(tmp_path, 0, data=tmp_path, access=AccessSettings(None, token="right-secret-value"))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/api/logs?lines=5&secret=query-secret-value"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            urllib.request.urlopen(base)
+        assert failure.value.code == 401
+        for _ in range(2):
+            with pytest.raises(urllib.error.HTTPError) as failure:
+                urllib.request.urlopen(urllib.request.Request(
+                    base, headers={"Authorization": "Bearer wrong-secret-value"},
+                ))
+            assert failure.value.code == 401
+        messages = [record.getMessage() for record in caplog.records if record.name == "xiyue"]
+        assert sum(message.startswith("AUTH-REJECT") for message in messages) == 1
+        with urllib.request.urlopen(urllib.request.Request(
+            base, headers={"Authorization": "Bearer right-secret-value"},
+        )) as response:
+            assert response.status == 200
+            assert isinstance(json.load(response)["lines"], list)
+        assert "wrong-secret-value" not in caplog.text
+        assert "right-secret-value" not in caplog.text
+        assert "query-secret-value" not in caplog.text
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_logs_http_download_and_settings_do_not_expose_token(tmp_path, container_logger):
+    container_logger.info("logs visible")
+    server = make_server(tmp_path, 0, data=tmp_path, access=AccessSettings(None))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(base + "/api/logs?lines=5") as response:
+            lines = json.load(response)["lines"]
+            assert isinstance(lines, list) and len(lines) <= 5
+            assert "logs visible" in lines[-1]
+        with urllib.request.urlopen(base + "/api/logs/download") as response:
+            assert "xiyue-container.log" in response.getheader("Content-Disposition")
+            assert response.getheader("Content-Type") == "text/plain; charset=utf-8"
+            assert b"logs visible" in response.read()
+        request = urllib.request.Request(
+            base + "/api/access",
+            data=json.dumps({"hostIP": "192.168.1.2", "network": "192.168.1.0/24", "token": "a" * 32}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 200
+        text = (tmp_path / "logs" / "container.log").read_text(encoding="utf-8")
+        assert "SETTINGS access saved" in text
+        assert "a" * 32 not in text
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_logs_events_without_address_path(tmp_path, caplog):
+    caplog.set_level("INFO", logger="xiyue")
+    address_path = "/private-download-address"
+    server, base = _file_server({address_path: (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        job = _wait_for(downloads, downloads.submit({
+            "url": base + address_path + "?secret=download-secret-value", "filename": "歌.flac",
+        }))
+        assert job["state"] == "done"
+        assert "DOWNLOAD-START" in caplog.text
+        assert "DOWNLOAD-END" in caplog.text
+        assert address_path not in caplog.text
+        assert base not in caplog.text
+        assert "download-secret-value" not in caplog.text
+    finally:
+        server.shutdown()
+        server.server_close()

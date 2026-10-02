@@ -126,3 +126,9 @@ docker run --rm -v "$PWD/tests:/app/tests:ro" xiyue-taste python -m pytest -q -p
 ```bash
 python3 -c "import gzip,json;d=json.load(gzip.open('out/xiyue-taste-v1.json.gz'));print(len(d['tracks']))"
 ```
+
+## 日志
+
+日志在面板右上角“日志”里查看和下载。
+日志文件保存在 `data/logs/`，最多约 3 MB，自动轮换。
+里面没有口令和密钥。

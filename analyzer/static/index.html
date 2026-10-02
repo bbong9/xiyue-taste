@@ -278,6 +278,7 @@
     .ai-result.good { color: var(--sea); border-color: color-mix(in srgb, var(--sea) 40%, transparent); }
     .ai-result.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
     .ai-note { margin: 22px 0 0; color: var(--faint); font-size: 12px; line-height: 1.7; }
+    .logs-text { font: 12px/1.6 var(--mono); color: var(--muted); max-height: 60vh; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
     .drawer h3 { margin: 28px 0 8px; font: 600 16px var(--serif); letter-spacing: .2em; }
     .drawer h3 small { font: 12px var(--sans); color: var(--muted); letter-spacing: 0; margin-left: 8px; }
     .near-list { list-style: none; margin: 0 -12px; padding: 0; }
@@ -345,6 +346,7 @@
         <span class="status" id="status"><i></i><span id="status-text">连接中</span></span>
         <button class="scan quiet" id="ai-open" type="button">AI 设置</button>
         <button class="scan quiet" id="access-open" type="button">连接设置</button>
+        <button class="scan quiet" id="logs-open" type="button">日志</button>
         <button class="scan" id="scan" type="button">立即扫描</button>
       </div>
     </header>
@@ -475,6 +477,16 @@
     <p class="ai-note">口令保存后不会再显示。先把它复制到 App 的 设置 → AI 助手 → 访问口令，再点保存。</p>
     <p class="ai-note">在家不用口令；在外面要给 8790 端口做一个 https 外网地址，并在 App 里填上它和口令。</p>
   </aside>
+  <aside class="drawer" id="logs-drawer" role="dialog" aria-modal="true" aria-labelledby="logs-title" aria-hidden="true">
+    <button class="close" id="logs-close" type="button" aria-label="关闭"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m3.5 3.5 9 9m0-9-9 9" stroke-linecap="round"/></svg></button>
+    <h2 class="d-title" id="logs-title">日志</h2>
+    <p class="d-sub">出问题时把日志下载下来发给作者。里面没有口令和密钥。</p>
+    <pre class="ai-result logs-text" id="logs-text"></pre>
+    <div class="ai-actions">
+      <button class="scan quiet" id="logs-refresh" type="button">刷新</button>
+      <button class="scan" id="logs-download" type="button">下载日志</button>
+    </div>
+  </aside>
 
   <script>
     const $ = id => document.getElementById(id);
@@ -503,7 +515,7 @@
       for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
       return node;
     }
-    async function api(path, options) {
+    async function api(path, options, asBlob = false) {
       const headers = new Headers(options?.headers);
       let token;
       try {
@@ -515,7 +527,7 @@
       const response = await fetch(path, { ...options, headers });
       if (response.status === 401) $("access-token-form").hidden = false;
       if (!response.ok) throw new Error(String(response.status));
-      return response.json();
+      return asBlob ? response.blob() : response.json();
     }
     function offline(on) { $("offline").hidden = !on || !$("access-token-form").hidden; }
     function relativeTime(value) {
@@ -573,7 +585,7 @@
       renderTime("last-scan", status.finishedAt);
       renderTime("next-scan", status.nextScanAt);
       $("scan-error").hidden = !status.error;
-      $("scan-error").textContent = status.error ? `上次扫描出错：${status.error}` : "";
+      $("scan-error").textContent = status.error === "WorkersKeepDying" ? "上次扫描中断：分析进程接连被系统结束，多半是 NAS 内存不够或处理器太老。" : status.error ? `上次扫描出错：${status.error}` : "";
       $("failures").hidden = status.failedCount === 0;
       $("failures-title").textContent = `有 ${status.failedCount} 首没分析成功`;
     }
@@ -772,7 +784,8 @@
       const failures = await api("/api/failures");
       $("failure-list").replaceChildren(...failures.map(failure => {
         const row = el("li");
-        row.append(el("code", "", failure.path), el("code", "", failure.error));
+        const error = failure.error === "WorkerDied" ? "分析这首时进程被系统结束" : failure.error === "BrokenProcessPool" ? "被别的歌连累，下次扫描会重试" : failure.error;
+        row.append(el("code", "", failure.path), el("code", "", error));
         return row;
       }));
     }
@@ -896,7 +909,7 @@
       $("drawer").classList.remove("open");
       $("drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
-      setTimeout(() => { if (!$("drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("access-drawer").classList.contains("open")) $("scrim").hidden = true; }, 300);
+      setTimeout(() => { if (!$("drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("access-drawer").classList.contains("open") && !$("logs-drawer").classList.contains("open")) $("scrim").hidden = true; }, 300);
       selected = null;
       highlight();
       previousFocus?.focus({ preventScroll: true });
@@ -914,6 +927,7 @@
     async function openAI() {
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("access-drawer").classList.contains("open")) closeAccess();
+      if ($("logs-drawer").classList.contains("open")) closeLogs();
       aiFocus = document.activeElement;
       aiResult("");
       $("ai-key").value = "";
@@ -935,7 +949,7 @@
       $("ai-drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
       setTimeout(() => {
-        if (!$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open") && !$("access-drawer").classList.contains("open")) $("scrim").hidden = true;
+        if (!$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open") && !$("access-drawer").classList.contains("open") && !$("logs-drawer").classList.contains("open")) $("scrim").hidden = true;
       }, 300);
       aiFocus?.focus({ preventScroll: true });
     }
@@ -1022,6 +1036,7 @@
     async function openAccess() {
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("ai-drawer").classList.contains("open")) closeAI();
+      if ($("logs-drawer").classList.contains("open")) closeLogs();
       accessFocus = document.activeElement;
       accessResult("");
       $("access-key").value = "";
@@ -1040,7 +1055,7 @@
       $("access-drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
       setTimeout(() => {
-        if (!$("access-drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open")) $("scrim").hidden = true;
+        if (!$("access-drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open") && !$("logs-drawer").classList.contains("open")) $("scrim").hidden = true;
       }, 300);
       accessFocus?.focus({ preventScroll: true });
     }
@@ -1080,6 +1095,59 @@
       }
     });
 
+    let logsFocus = null;
+    async function loadLogs() {
+      $("logs-refresh").disabled = true;
+      try {
+        const result = await api("/api/logs?lines=300");
+        $("logs-text").textContent = result.lines.join("\n");
+        $("logs-text").scrollTop = $("logs-text").scrollHeight;
+      } catch {
+        $("logs-text").textContent = "读不到日志";
+      } finally {
+        $("logs-refresh").disabled = false;
+      }
+    }
+    function openLogs() {
+      if ($("drawer").classList.contains("open")) closeDetail();
+      if ($("ai-drawer").classList.contains("open")) closeAI();
+      if ($("access-drawer").classList.contains("open")) closeAccess();
+      logsFocus = document.activeElement;
+      $("scrim").hidden = false;
+      requestAnimationFrame(() => $("scrim").classList.add("show"));
+      $("logs-drawer").classList.add("open");
+      $("logs-drawer").setAttribute("aria-hidden", "false");
+      loadLogs();
+    }
+    function closeLogs() {
+      $("logs-drawer").classList.remove("open");
+      $("logs-drawer").setAttribute("aria-hidden", "true");
+      $("scrim").classList.remove("show");
+      setTimeout(() => {
+        if (!$("logs-drawer").classList.contains("open") && !$("access-drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open")) $("scrim").hidden = true;
+      }, 300);
+      logsFocus?.focus({ preventScroll: true });
+    }
+    $("logs-open").addEventListener("click", openLogs);
+    $("logs-close").addEventListener("click", closeLogs);
+    $("logs-refresh").addEventListener("click", loadLogs);
+    $("logs-download").addEventListener("click", async () => {
+      $("logs-download").disabled = true;
+      try {
+        const blob = await api("/api/logs/download", undefined, true);
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "xiyue-container.log";
+        link.click();
+        URL.revokeObjectURL(url);
+      } catch {
+        $("logs-text").textContent = "下载日志失败";
+      } finally {
+        $("logs-download").disabled = false;
+      }
+    });
+
     $("access-token-form").addEventListener("submit", async event => {
       event.preventDefault();
       try {
@@ -1112,10 +1180,15 @@
     $("failures").addEventListener("toggle", () => { if ($("failures").open) loadFailures().catch(() => offline(true)); });
     $("d-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", () => {
-      if ($("access-drawer").classList.contains("open")) closeAccess();
+      if ($("logs-drawer").classList.contains("open")) closeLogs();
+      else if ($("access-drawer").classList.contains("open")) closeAccess();
       else if ($("ai-drawer").classList.contains("open")) closeAI(); else closeDetail();
     });
     document.addEventListener("keydown", event => {
+      if ($("logs-drawer").classList.contains("open")) {
+        if (event.key === "Escape") closeLogs();
+        return;
+      }
       if ($("access-drawer").classList.contains("open")) {
         if (event.key === "Escape") closeAccess();
         return;

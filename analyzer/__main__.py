@@ -4,12 +4,14 @@ import os
 import threading
 import time
 
+from . import log
 from .access import AccessSettings
 from .ask import Asker
 from .butler import Butler
 from .downloads import Downloads
 from .panel import OutputIndex, PanelState
-from .scan import scan
+from .log import LOGGER
+from .scan import probe_worker, scan
 from .serve import make_server
 from .settings import LLMSettings
 
@@ -36,6 +38,21 @@ def main():
     args = parser.parse_args()
 
     if args.command == "run":
+        log.setup(args.data)
+        for line in log.environment_lines():
+            LOGGER.info("ENV %s", line)
+        try:
+            with os.scandir(args.music) as entries:
+                music_count = sum(1 for _ in entries)
+        except OSError:
+            music_count = "未知"
+        LOGGER.info(
+            "MOUNTS music_read=%s music_entries=%s downloads_exists=%s downloads_write=%s out_write=%s",
+            "能" if os.access(args.music, os.R_OK) else "不能", music_count,
+            "是" if os.path.exists(args.downloads) else "否",
+            "能" if os.access(args.downloads, os.W_OK) else "不能",
+            "能" if os.access(args.out, os.W_OK) else "不能",
+        )
         network = os.environ.get("TASTE_TRUSTED_NETWORK")
         host_ip = os.environ.get("TASTE_HOST_IP", "")
         try:
@@ -46,6 +63,8 @@ def main():
             os.path.join(args.data, "access-settings.json"),
             token=os.environ.get("TASTE_ACCESS_TOKEN", ""), network=network, host_ip=host_ip,
         )
+        LOGGER.info("SETTINGS access status=%s", access.status())
+        LOGGER.info("WORKER-PROBE %s", probe_worker())
         os.nice(15)
         state = PanelState()
         index = OutputIndex(args.out)
@@ -63,7 +82,7 @@ def main():
             access=access,
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        print(f"Serving on port {args.port}.", flush=True)
+        LOGGER.info("Serving on port %s.", args.port)
         while True:
             state.begin_scan()
             try:
@@ -73,12 +92,13 @@ def main():
                 )
             except Exception as exception:
                 state.fail_scan(exception)
+                LOGGER.exception("SCAN-ABORT %s", type(exception).__name__)
             else:
                 state.finish_scan(result["analyzed"], result["tracks"])
             summary = state.snapshot()
-            print(
-                f"Analyzed {summary['lastAnalyzed']} files; exported {summary['lastExported']} tracks.",
-                flush=True,
+            LOGGER.info(
+                "Analyzed %s files; exported %s tracks.",
+                summary["lastAnalyzed"], summary["lastExported"],
             )
             interval = args.interval_hours * 3600
             state.set_next(time.time() + interval)
@@ -86,9 +106,9 @@ def main():
 
     while True:
         result = scan(args.music, args.data, args.out, workers=args.workers)
-        print(
-            f"Analyzed {result['analyzed']} files; exported {result['tracks']} tracks.",
-            flush=True,
+        LOGGER.info(
+            "Analyzed %s files; exported %s tracks.",
+            result["analyzed"], result["tracks"],
         )
         if args.command == "scan":
             return

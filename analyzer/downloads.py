@@ -24,6 +24,8 @@ from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 from mutagen.wave import WAVE
 
+from .log import LOGGER
+
 AUDIO_EXTENSIONS = ("flac", "mp3", "m4a", "aac", "ogg", "opus", "wav", "ape")
 MAX_AUDIO_BYTES = 600 * 1024 * 1024
 MIN_AUDIO_BYTES = 64 * 1024
@@ -206,6 +208,10 @@ class Downloads:
                 if len(self._jobs) <= KEPT_JOBS:
                     break
                 del self._jobs[old]
+            LOGGER.info(
+                "DOWNLOAD-START id=%s host=%s dir=%s file=%s",
+                job["id"], job["host"], job["directory"], job["filename"],
+            )
             self._wake.notify()
         return job["id"]
 
@@ -237,14 +243,22 @@ class Downloads:
                 item for item in folders if not item.startswith(".")
             )
             if name in files:
-                return "" if not relative.parts else relative.as_posix()
+                directory = "" if not relative.parts else relative.as_posix()
+                LOGGER.info("DOWNLOAD-LOCATE found=是 dir=%s", directory)
+                return directory
             seen += 1
             if seen > 20000:
                 break
+        LOGGER.info("DOWNLOAD-LOCATE found=否 dir=")
         raise DownloadError("not_found", 404)
 
     def _finish(self, job, state, error="", path=""):
         job.update(state=state, error=error, path=path, finishedAt=time.time(), url="", lyrics=None, cover=None)
+        LOGGER.info(
+            "DOWNLOAD-END id=%s state=%s error=%s bytes=%s format=%s seconds=%.2f",
+            job["id"], state, error, job.get("received", ""), job.get("format", ""),
+            job["finishedAt"] - job["createdAt"],
+        )
 
     def _work(self):
         while True:
