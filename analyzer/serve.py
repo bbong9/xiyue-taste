@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .ask import ASK_PARTS, AskError
+from .downloads import DownloadError
 from .settings import SettingsError
 
 
@@ -15,7 +16,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     _status = None
 
     def __init__(
-        self, *args, data=None, state=None, index=None, asker=None, butler=None, llm=None,
+        self, *args, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
         access_token="", trusted_network=ipaddress.ip_network("192.168.50.0/24"),
         host_ip="192.168.50.2", **kwargs,
     ):
@@ -25,6 +26,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self._asker = asker
         self._butler = butler
         self._llm = llm
+        self._downloads = downloads
         self._access_token = access_token
         self._trusted_network = trusted_network
         self._host_ip = host_ip
@@ -152,6 +154,11 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_json(
                     self._asker.status() if self._asker is not None else {"configured": False, "model": ""}
                 )
+            elif url.path == "/api/downloads":
+                if self._downloads is None:
+                    self._send_json({"available": False, "jobs": []})
+                else:
+                    self._send_json({"available": self._downloads.available(), "jobs": self._downloads.snapshot()})
             elif url.path == "/api/llm" and self._llm is not None:
                 self._send_json(self._llm.status())
             else:
@@ -169,6 +176,23 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             if path == "/api/scan" and self._panel_available():
                 self._state.request_scan()
                 self._send_json({"ok": True})
+            elif path in ("/api/downloads", "/api/downloads/cancel", "/api/downloads/locate"):
+                if self._downloads is None:
+                    self._send_json({"error": "download_unconfigured"}, 503)
+                    return
+                body = self._read_json(6 * 1024 * 1024)
+                if body is None:
+                    return
+                if path == "/api/downloads/cancel":
+                    self._send_json({"ok": self._downloads.cancel(body.get("id"))})
+                    return
+                try:
+                    if path == "/api/downloads/locate":
+                        self._send_json({"directory": self._downloads.locate(body.get("name"))})
+                    else:
+                        self._send_json({"id": self._downloads.submit(body)})
+                except DownloadError as error:
+                    self._send_json({"error": error.code}, error.status)
             elif path == "/api/llm" and self._llm is not None:
                 body = self._read_json(4096)
                 if body is None:
@@ -248,11 +272,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
 
 def make_server(
-    out, port, data=None, state=None, index=None, asker=None, butler=None, llm=None,
+    out, port, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
     access_token="", trusted_network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2",
 ):
     handler = functools.partial(
         _Handler, directory=str(out), data=data, state=state, index=index, asker=asker, butler=butler, llm=llm,
+        downloads=downloads,
         access_token=access_token, trusted_network=trusted_network, host_ip=host_ip,
     )
     return http.server.ThreadingHTTPServer(("", port), handler)

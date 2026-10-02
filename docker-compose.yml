@@ -14,6 +14,7 @@ services:
       - "${MUSIC_DIR}:/music:ro"
       - "./data:/data"
       - "${OUT_DIR}:/out"
+      - "${DOWNLOAD_DIR:-./downloads}:/downloads"
     ports:
       - "0.0.0.0:8790:8790"
     cpus: "2.0"

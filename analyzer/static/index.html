@@ -176,6 +176,13 @@
     .rank-bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--tide), var(--sea)); border-radius: 2px; }
     .ranks li:first-child .rank-bar i { background: linear-gradient(90deg, var(--moon), var(--tide)); }
     .empty { color: var(--faint); font-size: 13px; padding: 8px 0; display: block; }
+    .dl { list-style: none; margin: 0; padding: 0; }
+    .dl li { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 10px 0; border-top: 1px solid var(--line); font-size: 14px; }
+    .dl b { font-weight: 500; overflow-wrap: anywhere; }
+    .dl small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
+    .dl span { flex: none; color: var(--muted); font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+    .dl .good span { color: var(--sea); }
+    .dl .bad span { color: var(--danger); }
 
     .search {
       position: relative; width: min(320px, 100%);
@@ -392,6 +399,11 @@
         <span id="page"></span>
         <button id="next" type="button" aria-label="下一页"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m6 3 5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
       </div>
+    </section>
+
+    <section class="card" id="downloads" hidden>
+      <div class="head"><div><h2>代下载</h2><p id="downloads-total"></p></div></div>
+      <ul class="dl" id="download-list"></ul>
     </section>
 
     <details class="fail" id="failures" hidden>
@@ -739,9 +751,35 @@
       }));
     }
 
+    const downloadErrors = {
+      not_audio: "下到的不是音频", incomplete: "没下完整", too_large: "文件太大", no_space: "空间不够",
+      bad_url: "地址不能用", outside: "文件夹不在下载目录里", name_taken: "重名太多", unreachable: "连不上",
+      io_failed: "网络或读写出错",
+    };
+    let downloading = false;
+    function megabytes(value) { return (value / 1048576).toFixed(1) + " MB"; }
+    async function loadDownloads() {
+      const { jobs } = await api("/api/downloads");
+      downloading = jobs.some(job => job.state === "queued" || job.state === "downloading");
+      $("downloads").hidden = !jobs.length;
+      const failed = jobs.filter(job => job.state === "failed").length;
+      $("downloads-total").textContent = `最近 ${jobs.length} 首` + (failed ? `，${failed} 首没下成` : "");
+      $("download-list").replaceChildren(...jobs.map(job => {
+        const row = el("li", job.state === "done" ? "good" : job.state === "failed" ? "bad" : "");
+        const name = el("div");
+        name.append(el("b", "", job.filename), el("small", "", job.path || job.directory || "下载目录"));
+        let state = "排队中";
+        if (job.state === "downloading") state = job.total ? `${Math.floor(job.received / job.total * 100)}% · ${megabytes(job.total)}` : megabytes(job.received);
+        else if (job.state === "done") state = "完成 · " + megabytes(job.received);
+        else if (job.state === "cancelled") state = "已取消";
+        else if (job.state === "failed") state = downloadErrors[job.error] || (job.error.startsWith("http_") ? "被拒 " + job.error.slice(5) : "失败");
+        row.append(name, el("span", "", state));
+        return row;
+      }));
+    }
     function schedulePoll() {
       clearTimeout(pollTimer);
-      if (!document.hidden) pollTimer = setTimeout(pollStatus, $("status").classList.contains("scanning") ? 2000 : 15000);
+      if (!document.hidden) pollTimer = setTimeout(pollStatus, downloading || $("status").classList.contains("scanning") ? 2000 : 15000);
     }
 
     async function pollStatus() {
@@ -754,6 +792,7 @@
         const changed = !lastStatus || lastStatus.trackCount !== status.trackCount || lastStatus.finishedAt !== status.finishedAt;
         renderStatus(status);
         lastStatus = status;
+        await loadDownloads().catch(() => {});
         if (changed) {
           await Promise.all([loadStats(), loadAllTracks(), loadTracks()]);
           renderMap();

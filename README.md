@@ -85,6 +85,14 @@ Compose 从同目录的 `.env` 读取以下环境变量并传给容器：
 
 两接口共用“说一句找歌”的三个环境变量，会把歌名、歌手、专辑、文件路径发给模型服务商。容器只给建议，不修改任何文件。
 
+## 代下载
+
+在 `.env` 中用 `DOWNLOAD_DIR` 指定存歌目录，不填默认使用本目录下的 `downloads/`；下载及歌词、封面只写入这里，`/music` 仍只读。
+`POST /api/downloads`：必填 `url`、`filename`，可选 `directory`、`userAgent`、`referer`、`lyrics`、`cover`（base64），返回 `{"id":"任务编号"}`。
+`GET /api/downloads` 返回 `{"available":true,"jobs":[]}`，任务中不返回下载地址；`POST /api/downloads/cancel` 接收 `{"id":"任务编号"}`。
+`POST /api/downloads/locate` 接收 `{"name":"标记文件名"}`：手机先经自己的连接在 App 目标文件夹放入 `.xiyue-probe-<32位十六进制>` 文件，容器返回 `{"directory":"子文件夹"}`，根目录返回空字符串，找不到返回 404，用于确认双方指向同一文件夹。
+重名时保留两份，第二份命名为 `名字 (2).flac`；代下载只连接公网地址。
+
 ## 从旧版本升级
 
 在设置好 `MUSIC_DIR` 和 `OUT_DIR` 的终端中执行：

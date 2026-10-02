@@ -6,6 +6,7 @@ import time
 
 from .ask import Asker
 from .butler import Butler
+from .downloads import Downloads
 from .panel import OutputIndex, PanelState
 from .scan import scan
 from .serve import make_server
@@ -30,6 +31,7 @@ def main():
     command.add_argument("--workers", type=int, default=2)
     command.add_argument("--interval-hours", type=float, default=24)
     command.add_argument("--port", type=int, default=8790)
+    command.add_argument("--downloads", default="/downloads")
     args = parser.parse_args()
 
     if args.command == "run":
@@ -54,6 +56,7 @@ def main():
         )
         server = make_server(
             args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler, llm=llm,
+            downloads=Downloads(args.downloads),
             access_token=access_token, trusted_network=trusted_network, host_ip=host_ip,
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()

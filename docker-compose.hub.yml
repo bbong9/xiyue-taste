@@ -2,6 +2,7 @@
 # 同目录放一个 .env，填写：
 #   MUSIC_DIR=/你的音乐目录
 #   OUT_DIR=/分析结果输出目录
+#   DOWNLOAD_DIR=/代下载的歌存到哪个目录（不填就存到本目录下的 downloads/）
 #   TASTE_LLM_API_KEY=硅基流动密钥（不填则“说一句找歌”不可用）
 services:
   taste:
@@ -19,6 +20,7 @@ services:
       - "${MUSIC_DIR}:/music:ro"
       - "./data:/data"
       - "${OUT_DIR}:/out"
+      - "${DOWNLOAD_DIR:-./downloads}:/downloads"
     ports:
       - "0.0.0.0:8790:8790"
     cpus: "2.0"

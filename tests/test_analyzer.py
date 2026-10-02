@@ -1,5 +1,7 @@
+import base64
 import gzip
 import http.client
+import http.server
 import io
 import json
 import os
@@ -7,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -896,6 +899,228 @@ def test_llm_http_reads_saves_and_never_returns_the_key(tmp_path):
         with pytest.raises(urllib.error.HTTPError) as failure:
             post({"baseURL": "nope", "model": "m"})
         assert failure.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+from analyzer.downloads import Downloads, DownloadError
+
+_AUDIO = b"fLaC" + bytes(70_000)
+
+
+def _file_server(files):
+    """Serves {path: (status, bytes)} on 127.0.0.1; returns (server, base)."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            status, payload = files.get(self.path.split("?", 1)[0], (404, b""))
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def _wait_for(downloads, job_id):
+    for _ in range(100):
+        job = next(item for item in downloads.snapshot() if item["id"] == job_id)
+        if job["finishedAt"] is not None:
+            return job
+        time.sleep(0.05)
+    raise AssertionError("download did not finish")
+
+
+def test_download_saves_the_song_with_lyrics_and_cover_next_to_it(tmp_path):
+    server, base = _file_server({"/a": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        cover = b"\xff\xd8\xff" + bytes(10)
+        job_id = downloads.submit({
+            "url": base + "/a?secret=1",
+            "filename": "歌.flac",
+            "directory": "歌手/专辑",
+            "lyrics": "[00:01.00]词",
+            "cover": base64.b64encode(cover).decode("ascii"),
+        })
+        job = _wait_for(downloads, job_id)
+        assert job["state"] == "done"
+        assert job["path"] == "歌手/专辑/歌.flac"
+        directory = tmp_path / "歌手" / "专辑"
+        assert (directory / "歌.flac").read_bytes() == _AUDIO
+        assert (directory / "歌.lrc").read_text(encoding="utf-8") == "[00:01.00]词"
+        assert (directory / "歌.jpg").read_bytes() == cover
+        assert not any(path.name.startswith(".xiyue-part-") for path in tmp_path.rglob("*"))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_keeps_both_when_the_name_is_taken(tmp_path):
+    server, base = _file_server({"/a": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        body = {"url": base + "/a", "filename": "歌.flac"}
+        first = _wait_for(downloads, downloads.submit(body))
+        second = _wait_for(downloads, downloads.submit(body))
+        assert first["state"] == "done"
+        assert second["state"] == "done"
+        assert second["path"] == "歌 (2).flac"
+        assert (tmp_path / "歌.flac").is_file()
+        assert (tmp_path / "歌 (2).flac").is_file()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_refuses_bad_names_and_addresses(tmp_path):
+    downloads = Downloads(tmp_path, allow_private=True)
+    body = {"url": "http://127.0.0.1/a", "filename": "歌.flac"}
+    for filename in ("../a.flac", ".a.flac", "a.txt", "a", "a/b.flac"):
+        with pytest.raises(DownloadError):
+            downloads.submit({**body, "filename": filename})
+    for directory in ("../x", "a/../b", ".x", "/x"):
+        with pytest.raises(DownloadError):
+            downloads.submit({**body, "directory": directory})
+    for url in ("ftp://x/a.flac", "file:///etc/passwd"):
+        with pytest.raises(DownloadError):
+            downloads.submit({**body, "url": url})
+    with pytest.raises(DownloadError):
+        downloads.submit({**body, "cover": "不是base64"})
+
+
+def test_download_fails_for_a_web_page_and_leaves_nothing(tmp_path):
+    server, base = _file_server({"/a": (200, b"<!doctype html>" + bytes(70_000))})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        job = _wait_for(downloads, downloads.submit({"url": base + "/a", "filename": "歌.flac"}))
+        assert job["state"] == "failed"
+        assert job["error"] == "not_audio"
+        assert not any(path.is_file() for path in tmp_path.rglob("*"))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_refuses_home_network_addresses_by_default(tmp_path):
+    server, base = _file_server({"/a": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path)
+        job = _wait_for(downloads, downloads.submit({"url": base + "/a", "filename": "歌.flac"}))
+        assert job["state"] == "failed"
+        assert job["error"] == "bad_url"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_reports_what_the_server_said(tmp_path):
+    server, base = _file_server({"/a": (403, b"")})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        job = _wait_for(downloads, downloads.submit({"url": base + "/a", "filename": "歌.flac"}))
+        assert job["state"] == "failed"
+        assert job["error"] == "http_403"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_http_lists_jobs_without_the_address(tmp_path):
+    file_server, file_base = _file_server({"/a": (200, _AUDIO)})
+    (tmp_path / "dl").mkdir()
+    server = make_server(
+        tmp_path, 0, data=tmp_path, state=PanelState(), index=_AskIndex(),
+        downloads=Downloads(tmp_path / "dl", allow_private=True),
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        request = urllib.request.Request(
+            base + "/api/downloads",
+            data=json.dumps({"url": file_base + "/a?secret=1", "filename": "歌.flac"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            job_id = json.load(response)["id"]
+        for _ in range(100):
+            with urllib.request.urlopen(base + "/api/downloads") as response:
+                text = response.read().decode("utf-8")
+            result = json.loads(text)
+            job = next(item for item in result["jobs"] if item["id"] == job_id)
+            if job["state"] == "done":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("download did not finish")
+        assert "secret=1" not in text
+        assert result["available"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        file_server.shutdown()
+        file_server.server_close()
+
+    server = make_server(tmp_path, 0, data=tmp_path, state=PanelState(), index=_AskIndex())
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/downloads",
+            data=b"{}", headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            urllib.request.urlopen(request)
+        assert failure.value.code == 503
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_locates_the_folder_the_phone_marked(tmp_path):
+    directory = tmp_path / "歌手" / "专辑"
+    directory.mkdir(parents=True)
+    name = ".xiyue-probe-" + "a" * 32
+    marker = directory / name
+    marker.write_text("")
+    downloads = Downloads(tmp_path)
+    assert downloads.locate(name) == "歌手/专辑"
+    marker.rename(tmp_path / name)
+    assert downloads.locate(name) == ""
+    with pytest.raises(DownloadError) as missing:
+        downloads.locate(".xiyue-probe-" + "b" * 32)
+    assert missing.value.status == 404
+    for invalid in ("../x", "歌.flac"):
+        with pytest.raises(DownloadError) as failure:
+            downloads.locate(invalid)
+        assert failure.value.status == 400
+
+
+def test_download_does_not_follow_a_link_out_of_the_folder(tmp_path):
+    root, outside = tmp_path / "dl", tmp_path / "out"
+    root.mkdir()
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    server, base = _file_server({"/a": (200, _AUDIO)})
+    try:
+        downloads = Downloads(root, allow_private=True)
+        for directory in ("linked", "linked/子"):
+            job = _wait_for(downloads, downloads.submit({
+                "url": base + "/a", "filename": "歌.flac", "directory": directory,
+            }))
+            assert job["state"] == "failed"
+            assert job["error"] == "outside"
+            assert list(outside.rglob("*")) == []
+        (root / "歌.lrc").symlink_to(outside / "x.lrc")
+        job = _wait_for(downloads, downloads.submit({
+            "url": base + "/a", "filename": "歌.flac", "lyrics": "[00:01.00]词",
+        }))
+        assert job["state"] == "done"
+        assert list(outside.rglob("*")) == []
     finally:
         server.shutdown()
         server.server_close()
