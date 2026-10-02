@@ -14,6 +14,16 @@ import uuid
 from collections import deque
 from pathlib import Path
 
+import mutagen
+from mutagen.aac import AAC
+from mutagen.flac import FLAC
+from mutagen.monkeysaudio import MonkeysAudio
+from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4
+from mutagen.oggopus import OggOpus
+from mutagen.oggvorbis import OggVorbis
+from mutagen.wave import WAVE
+
 AUDIO_EXTENSIONS = ("flac", "mp3", "m4a", "aac", "ogg", "opus", "wav", "ape")
 MAX_AUDIO_BYTES = 600 * 1024 * 1024
 MIN_AUDIO_BYTES = 64 * 1024
@@ -23,6 +33,10 @@ MAX_WAITING = 500
 KEPT_JOBS = 200
 SPARE_BYTES = 2 * 1024 * 1024 * 1024
 USER_AGENT = "Mozilla/5.0"
+SUFFIXES = {
+    "FLAC": "flac", "MP3": "mp3", "MP4": "m4a", "OggVorbis": "ogg", "OggOpus": "opus",
+    "WAVE": "wav", "MonkeysAudio": "ape", "AAC": "aac",
+}
 
 
 class DownloadError(Exception):
@@ -68,6 +82,31 @@ def _is_audio(head):
         or head[4:8] == b"ftyp"
         or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0)
     )
+
+
+def _facts(path):
+    """What the file really is, whatever its address or its name said."""
+    # By name and first bytes; then each kind in turn, for a song whose name
+    # says one format and whose bytes are another.
+    for kind in (mutagen.File, FLAC, MP4, OggOpus, OggVorbis, WAVE, MonkeysAudio, MP3, AAC):
+        try:
+            audio = kind(path)
+        except Exception:
+            continue
+        info = getattr(audio, "info", None)
+        suffix = SUFFIXES.get(type(audio).__name__)
+        length = getattr(info, "length", 0) or 0
+        if suffix is not None and length > 0:
+            break
+    else:
+        raise DownloadError("not_audio")
+    return {
+        "format": suffix,
+        "durationMs": int(length * 1000),
+        "sampleRate": int(getattr(info, "sample_rate", 0) or 0),
+        "bitDepth": int(getattr(info, "bits_per_sample", 0) or 0),
+        "bitRate": int(getattr(info, "bitrate", 0) or 0),
+    }
 
 
 def _cover_suffix(data):
@@ -141,6 +180,9 @@ class Downloads:
                 raise DownloadError("bad_request")
             if len(cover) > MAX_COVER_BYTES or _cover_suffix(cover) is None:
                 raise DownloadError("bad_request")
+        minimum = body.get("minDurationMs", 0)
+        if type(minimum) is not int or not 0 <= minimum <= 86_400_000:
+            raise DownloadError("bad_request")
         job = {
             "id": uuid.uuid4().hex,
             "filename": _filename(body.get("filename")),
@@ -148,6 +190,8 @@ class Downloads:
             "state": "queued", "received": 0, "total": 0, "error": "", "path": "",
             "host": urllib.parse.urlsplit(url).hostname,
             "createdAt": time.time(), "finishedAt": None,
+            "format": "", "durationMs": 0, "sampleRate": 0, "bitDepth": 0, "bitRate": 0,
+            "minDurationMs": minimum,
             "url": url,
             "userAgent": _text(body.get("userAgent", ""), 500),
             "referer": _text(body.get("referer", ""), 2000),
@@ -167,7 +211,7 @@ class Downloads:
 
     def snapshot(self):
         names = ("id", "filename", "directory", "state", "received", "total", "error", "path", "host",
-                 "createdAt", "finishedAt")
+                 "createdAt", "finishedAt", "format", "durationMs", "sampleRate", "bitDepth", "bitRate")
         with self._lock:
             return [{name: job[name] for name in names} for job in list(self._jobs.values())[::-1][:100]]
 
@@ -249,7 +293,8 @@ class Downloads:
         directory.mkdir(parents=True, exist_ok=True)
         for folder in made:
             self._own(folder, folder=True)
-        part = directory / f".xiyue-part-{job['id']}"
+        # Named like the song so the format is recognised by more than its first bytes.
+        part = directory / f".xiyue-part-{job['id']}.{job['filename'].rsplit('.', 1)[-1].lower()}"
         headers = {"User-Agent": job["userAgent"] or USER_AGENT}
         if job["referer"]:
             headers["Referer"] = job["referer"]
@@ -284,8 +329,13 @@ class Downloads:
                                 raise DownloadError("cancelled")
             if received < MIN_AUDIO_BYTES or (total and received != total):
                 raise DownloadError("incomplete")
-            stem, suffix = job["filename"].rsplit(".", 1)
-            final = directory / job["filename"]
+            facts = _facts(part)
+            if facts["durationMs"] < job["minDurationMs"]:
+                raise DownloadError("too_short")
+            with self._lock:
+                job.update(facts)
+            stem, suffix = job["filename"].rsplit(".", 1)[0], facts["format"]
+            final = directory / f"{stem}.{suffix}"
             for number in range(2, 100):
                 if not final.exists():
                     break

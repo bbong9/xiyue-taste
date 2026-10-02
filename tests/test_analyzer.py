@@ -906,7 +906,14 @@ def test_llm_http_reads_saves_and_never_returns_the_key(tmp_path):
 
 from analyzer.downloads import Downloads, DownloadError
 
-_AUDIO = b"fLaC" + bytes(70_000)
+def _real_flac(seconds=3):
+    buffer = io.BytesIO()
+    noise = np.random.default_rng(7).uniform(-0.5, 0.5, 44100 * seconds).astype("float32")
+    sf.write(buffer, noise, 44100, format="FLAC", subtype="PCM_16")
+    return buffer.getvalue()
+
+
+_AUDIO = _real_flac()
 
 
 def _file_server(files):
@@ -1121,6 +1128,55 @@ def test_download_does_not_follow_a_link_out_of_the_folder(tmp_path):
         }))
         assert job["state"] == "done"
         assert list(outside.rglob("*")) == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_reports_what_the_file_really_is(tmp_path):
+    server, base = _file_server({"/a": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        job = _wait_for(downloads, downloads.submit({"url": base + "/a", "filename": "歌.flac"}))
+        assert job["state"] == "done"
+        assert job["format"] == "flac"
+        assert job["sampleRate"] == 44100
+        assert job["bitDepth"] == 16
+        assert 2900 <= job["durationMs"] <= 3100
+        assert job["bitRate"] > 0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_names_the_file_by_its_real_format(tmp_path):
+    server, base = _file_server({"/a": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        job = _wait_for(downloads, downloads.submit({
+            "url": base + "/a", "filename": "歌.mp3", "lyrics": "词",
+        }))
+        assert job["state"] == "done"
+        assert job["path"] == "歌.flac"
+        assert (tmp_path / "歌.lrc").exists()
+        assert not (tmp_path / "歌.mp3").exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_refuses_a_song_cut_short_and_leaves_nothing(tmp_path):
+    server, base = _file_server({"/a": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        body = {"url": base + "/a", "filename": "歌.flac", "minDurationMs": 60000}
+        job = _wait_for(downloads, downloads.submit(body))
+        assert job["state"] == "failed"
+        assert job["error"] == "too_short"
+        assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+        for minimum in (-1, "3", True):
+            with pytest.raises(DownloadError):
+                downloads.submit({**body, "minDurationMs": minimum})
     finally:
         server.shutdown()
         server.server_close()

@@ -89,6 +89,8 @@ Compose 从同目录的 `.env` 读取以下环境变量并传给容器：
 
 在 `.env` 中用 `DOWNLOAD_DIR` 指定存歌目录，不填默认使用本目录下的 `downloads/`；下载及歌词、封面只写入这里，`/music` 仍只读。
 `POST /api/downloads`：必填 `url`、`filename`，可选 `directory`、`userAgent`、`referer`、`lyrics`、`cover`（base64），返回 `{"id":"任务编号"}`。
+`POST /api/downloads` 还可带 `minDurationMs`；实际音频时长低于这个值时，任务失败且不保留文件。
+文件扩展名按真实音频格式确定，任务信息会返回 `format`、`durationMs`、`sampleRate`、`bitDepth`、`bitRate`。
 `GET /api/downloads` 返回 `{"available":true,"jobs":[]}`，任务中不返回下载地址；`POST /api/downloads/cancel` 接收 `{"id":"任务编号"}`。
 `POST /api/downloads/locate` 接收 `{"name":"标记文件名"}`：手机先经自己的连接在 App 目标文件夹放入 `.xiyue-probe-<32位十六进制>` 文件，容器返回 `{"directory":"子文件夹"}`，根目录返回空字符串，找不到返回 404，用于确认双方指向同一文件夹。
 重名时保留两份，第二份命名为 `名字 (2).flac`；代下载只连接公网地址。

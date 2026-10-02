@@ -752,7 +752,7 @@
     }
 
     const downloadErrors = {
-      not_audio: "下到的不是音频", incomplete: "没下完整", too_large: "文件太大", no_space: "空间不够",
+      not_audio: "下到的不是音频", too_short: "时长不够，可能是试听片段", incomplete: "没下完整", too_large: "文件太大", no_space: "空间不够",
       bad_url: "地址不能用", outside: "文件夹不在下载目录里", name_taken: "重名太多", unreachable: "连不上",
       io_failed: "网络或读写出错",
     };
@@ -770,7 +770,7 @@
         name.append(el("b", "", job.filename), el("small", "", job.path || job.directory || "下载目录"));
         let state = "排队中";
         if (job.state === "downloading") state = job.total ? `${Math.floor(job.received / job.total * 100)}% · ${megabytes(job.total)}` : megabytes(job.received);
-        else if (job.state === "done") state = "完成 · " + megabytes(job.received);
+        else if (job.state === "done") state = [job.format.toUpperCase(), job.bitDepth ? job.bitDepth + " bit" : "", megabytes(job.received)].filter(Boolean).join(" · ");
         else if (job.state === "cancelled") state = "已取消";
         else if (job.state === "failed") state = downloadErrors[job.error] || (job.error.startsWith("http_") ? "被拒 " + job.error.slice(5) : "失败");
         row.append(name, el("span", "", state));
