@@ -6,11 +6,13 @@ import time
 
 from . import log
 from .access import AccessSettings
+from .accounts import AccountStore
 from .ask import Asker
 from .butler import Butler
 from .downloads import Downloads
 from .lxhost import Runner
 from .panel import OutputIndex, PanelState
+from .personal import PersonalStore
 from .log import LOGGER
 from .resolver import Resolver
 from .scan import probe_worker, scan
@@ -96,13 +98,15 @@ def main():
         runner = Runner()
         sources = SourceStore(args.data, runner)
         resolver = Resolver(sources, runner, args.data)
+        accounts = AccountStore(args.data)
+        personal = PersonalStore(args.data)
         runner.on_ready = sources.reload_all
         runner.on_alert = sources.note_alert
         threading.Thread(target=_run_sources, args=(runner, sources), name="sources", daemon=True).start()
         server = make_server(
             args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler, llm=llm,
             downloads=Downloads(args.downloads),
-            access=access, sources=sources, resolver=resolver,
+            access=access, sources=sources, resolver=resolver, accounts=accounts, personal=personal,
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
         LOGGER.info("Serving on port %s.", args.port)

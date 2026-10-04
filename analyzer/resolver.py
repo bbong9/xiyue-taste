@@ -3,13 +3,15 @@ keeps the books, and relays the audio a phone cannot fetch itself.
 
 A source tries each tier it has before the next source is asked; sources take turns by what is left
 of their daily quota and how they have done lately. The owner is counted and never refused; any
-other account stops at the family limits set in the panel. No log line or panel answer carries an
+other account stops at the family limits set in the panel; the same song counts only once per day,
+separately for play and download. No log line or panel answer carries an
 address, a ticket or a script: a line names the host and the source id only.
 """
 
 import collections
 import concurrent.futures
 import datetime
+import hashlib
 import http.client
 import json
 import re
@@ -37,7 +39,6 @@ MAX_FAMILY_LIMIT = 10_000
 USAGE_DAYS = 31
 CACHE_SECONDS = 600
 CACHE_ENTRIES = 500
-MAX_PLAYS = 2000
 TICKET_SECONDS = 600
 MAX_TICKETS = 1000
 FAILURE_WINDOW = 600
@@ -118,16 +119,23 @@ def _usage_days(saved):
     for day, book in found.items() if isinstance(found, dict) else ():
         if not isinstance(day, str) or not _DAY.fullmatch(day) or not isinstance(book, dict):
             continue
-        sources, accounts = book.get("sources"), book.get("accounts")
+        sources, accounts, songs = book.get("sources"), book.get("accounts"), book.get("songs")
         days[day] = {
             "sources": {
                 key: _count(value) for key, value in sources.items() if isinstance(key, str) and 0 < len(key) <= 64
             } if isinstance(sources, dict) else {},
             "accounts": {
-                key: {kind: _count(value.get(kind)) for kind in KINDS}
+                key: {kind: _count(value.get(kind)) for kind in (*KINDS, "ask")}
                 for key, value in accounts.items()
                 if isinstance(key, str) and 0 < len(key) <= 64 and isinstance(value, dict)
             } if isinstance(accounts, dict) else {},
+            "songs": {
+                key: {
+                    kind: [song for song in value.get(kind, []) if isinstance(song, str) and re.fullmatch(r"[0-9a-f]{16}", song)]
+                    for kind in KINDS if isinstance(value.get(kind, []), list)
+                }
+                for key, value in songs.items() if isinstance(key, str) and isinstance(value, dict)
+            } if isinstance(songs, dict) else {},
         }
     return days
 
@@ -161,12 +169,15 @@ class SourceLedger:
         first = (datetime.date.fromisoformat(today) - datetime.timedelta(days=USAGE_DAYS - 1)).isoformat()
         for day in [day for day in self._days if day < first]:
             del self._days[day]
+        for day, book in self._days.items():
+            if day != today:
+                book.pop("songs", None)
 
     def _book(self, day):
         # Under self._lock: the day's counts, made (and the oldest days dropped) on first use.
         book = self._days.get(day)
         if book is None:
-            book = self._days[day] = {"sources": {}, "accounts": {}}
+            book = self._days[day] = {"sources": {}, "accounts": {}, "songs": {}}
             self._prune(day)
         return book
 
@@ -180,27 +191,44 @@ class SourceLedger:
                 self._warned = now
                 LOGGER.warning("SOURCE-USAGE save-failed error=%s", type(error).__name__)
 
-    def charge(self, account, kind):
+    def charge(self, account, kind, song):
         """One song resolved for an account (kind is "download" or "play"). Any account but the
         owner is refused at its daily limit. Returns a receipt for refund()."""
         with self._lock:
             day = self.today()
-            accounts = self._book(day)["accounts"]
-            counts = accounts.get(account) or {name: 0 for name in KINDS}
+            book = self._book(day)
+            songs = book.setdefault("songs", {}).setdefault(account, {}).setdefault(kind, [])
+            hashed = hashlib.sha256(song.encode("utf-8")).hexdigest()[:16]
+            if hashed in songs:
+                return None
+            accounts = book["accounts"]
+            counts = accounts.get(account) or {name: 0 for name in (*KINDS, "ask")}
             if account != OWNER and counts[kind] >= self._limits[FAMILY_LIMITS[kind]]:
                 raise ResolveError("quota_exceeded", 429)
             counts[kind] += 1
             accounts[account] = counts
+            songs.append(hashed)
             self._save()
-        return day, account, kind
+        return day, account, kind, hashed
 
     def refund(self, receipt):
-        day, account, kind = receipt
+        day, account, kind, hashed = receipt
         with self._lock:
-            counts = self._days.get(day, {}).get("accounts", {}).get(account)
+            book = self._days.get(day, {})
+            counts = book.get("accounts", {}).get(account)
             if counts is not None and counts[kind] > 0:
                 counts[kind] -= 1
+                songs = book.get("songs", {}).get(account, {}).get(kind, [])
+                if hashed in songs:
+                    songs.remove(hashed)
                 self._save()
+
+    def note(self, account, kind):
+        """AI answers are counted without a limit."""
+        with self._lock:
+            counts = self._book(self.today())["accounts"].setdefault(account, {name: 0 for name in (*KINDS, "ask")})
+            counts[kind] += 1
+            self._save()
 
     def take_source(self, source_id, quota, enforce):
         """One musicUrl call on a source's books; with enforce, a source at its quota is left alone (None)."""
@@ -338,7 +366,6 @@ _Request = collections.namedtuple("_Request", "platform info songmid quality exa
 _Resolved = collections.namedtuple("_Resolved", "url quality source_id source_name expires cached")
 _Cached = collections.namedtuple("_Cached", "url source_id expires")
 _Landing = collections.namedtuple("_Landing", "tier expires")
-_Mark = collections.namedtuple("_Mark", "expires")
 
 
 class _Ticket:
@@ -492,7 +519,6 @@ class Resolver:
         self._lock = threading.Lock()
         self._urls = collections.OrderedDict()
         self._landings = collections.OrderedDict()
-        self._plays = collections.OrderedDict()
         self._tickets = collections.OrderedDict()
         self._health = {}
         self._streams = threading.BoundedSemaphore(MAX_STREAMS)
@@ -542,9 +568,10 @@ class Resolver:
             "sourceName": found.source_name,
         }
         try:
-            job_id = downloads.submit(job)
+            job_id = downloads.submit(job, account)
         except DownloadError:
-            self.ledger.refund(receipt)
+            if receipt is not None:
+                self.ledger.refund(receipt)
             raise
         return {"id": job_id, "quality": found.quality, "sourceName": found.source_name}
 
@@ -765,24 +792,15 @@ class Resolver:
         """(the song's address, the account's receipt or None). The account is charged before any
         source is asked, so a family account past its limit costs no source a call."""
         hit = self._cached(request)
+        receipt = self.ledger.charge(account, request.purpose, f"{request.platform}|{request.songmid}")
         if hit is not None:
-            receipt = None
-            if request.purpose == "download" or self._first_play(account, request, hit.quality):
-                try:
-                    receipt = self.ledger.charge(account, request.purpose)
-                except ResolveError:
-                    self._forget_play(account, request, hit.quality)
-                    raise
             return hit, receipt
-        receipt = self.ledger.charge(account, request.purpose)
         try:
             found = self._ask_sources(request, account == OWNER)
         except BaseException:
-            self.ledger.refund(receipt)
+            if receipt is not None:
+                self.ledger.refund(receipt)
             raise
-        if request.purpose == "play" and not self._first_play(account, request, found.quality):
-            self.ledger.refund(receipt)
-            receipt = None
         return found, receipt
 
     def _cached(self, request):
@@ -804,21 +822,6 @@ class Resolver:
         if entry is None or not entry["enabled"] or entry["dailyQuota"] <= 0:
             return None
         return _Resolved(cached.url, tier, cached.source_id, entry["displayName"], cached.expires, True)
-
-    def _first_play(self, account, request, tier):
-        """Marks a play; False when the account played this song at this tier in the last 10 minutes."""
-        key = (account, request.platform, request.songmid, tier)
-        now = self._clock()
-        with self._lock:
-            _trim(self._plays, now, MAX_PLAYS)
-            if key in self._plays:
-                return False
-            _put(self._plays, key, _Mark(now + CACHE_SECONDS), now, MAX_PLAYS)
-            return True
-
-    def _forget_play(self, account, request, tier):
-        with self._lock:
-            self._plays.pop((account, request.platform, request.songmid, tier), None)
 
     def _ask_sources(self, request, owner):
         """Each source in turn, each of its tiers from the preferred one down, until an address passes.

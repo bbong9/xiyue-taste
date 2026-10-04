@@ -11,15 +11,19 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import log
 from .access import AccessError, AccessSettings
+from .accounts import AccountError
 from .ask import ASK_PARTS, AskError
 from .downloads import DownloadError
 from .log import LOGGER
-from .resolver import OWNER, ResolveError
+from .personal import PersonalError
+from .resolver import FAMILY_DEFAULTS, OWNER, ResolveError
 from .settings import SettingsError
 from .sources import SourceError
 
 
 _SOURCE_ITEM = re.compile(r"/api/sources/([0-9a-f]{16})(/test|/replace|/refresh|/rollback)?")
+_ACCOUNT_ITEM = re.compile(r"/api/accounts/([0-9a-f]{16})(?:/devices/([0-9a-f]{16}))?")
+_DISABLED = object()
 _STREAM_PREFIX = "/api/source/stream/"
 _auth_rejections = {}
 _auth_rejections_lock = threading.Lock()
@@ -49,10 +53,11 @@ def _log_auth_reject(address, path, headers):
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
     _status = None
+    _identity = None
 
     def __init__(
         self, *args, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-        access=None, sources=None, resolver=None, **kwargs,
+        access=None, sources=None, resolver=None, accounts=None, personal=None, **kwargs,
     ):
         self._data = data
         self._state = state
@@ -64,7 +69,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self._access = access
         self._sources = sources
         self._resolver = resolver
+        self._accounts = accounts
+        self._personal = personal
         super().__init__(*args, **kwargs)
+
+    def parse_request(self):
+        self._identity = None
+        return super().parse_request()
 
     def send_response(self, code, message=None):
         self._status = code
@@ -90,7 +101,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         return self._access.trusted(self.client_address[0], self.headers)
 
     def _authorized(self) -> bool:
-        return self._is_trusted() or self._access.token_matches(self.headers)
+        account = self._account()
+        return account is not None and account is not _DISABLED
+
+    def _reject_auth(self):
+        if self._account() is _DISABLED:
+            self._send_json({"error": "account_disabled"}, 403)
+        else:
+            self._send_json({"error": "unauthorized"}, 401)
 
     def _send_json(self, value, status=200):
         if status == 401:
@@ -132,16 +150,132 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return default
 
     def _account(self):
-        # Every authorized caller is the owner until family accounts arrive (card 47).
-        return OWNER
+        if self._identity is None:
+            authorization = self.headers.get("Authorization", "")
+            if authorization.startswith("Bearer xyd_"):
+                self._identity = self._accounts.lookup(authorization[7:]) if self._accounts is not None else ("unknown", None)
+            elif self._access.token_matches(self.headers) or self._is_trusted():
+                self._identity = ("ok", OWNER)
+            else:
+                self._identity = ("unknown", None)
+        state, account = self._identity
+        return _DISABLED if state == "disabled" else account
+
+    def _owner_only(self):
+        if self._account() == OWNER:
+            return True
+        self._send_json({"error": "owner_only"}, 403)
+        return False
 
     def _home_only(self):
         """The sources are seen and changed at home only, like the connection settings."""
+        if not self._owner_only():
+            return False
         if self._is_trusted():
             return True
         LOGGER.warning("SOURCE-PANEL rejected addr=%s", self.client_address[0])
         self._send_json({"error": "home_only"}, 403)
         return False
+
+    def _accounts_configured(self, path):
+        if path.startswith(("/api/account", "/api/me/")) and (self._accounts is None or self._personal is None):
+            self._send_json({"error": "accounts_unconfigured"}, 503)
+            return False
+        return True
+
+    def _account_info(self, account):
+        limits = self._resolver.ledger.limits() if self._resolver is not None else FAMILY_DEFAULTS
+        today = self._resolver.ledger.recent(1)[0]["accounts"].get(account, {}) if self._resolver is not None else {}
+        return {
+            "account": {"id": account, "name": self._accounts.name_of(account), "owner": account == OWNER},
+            "limits": None if account == OWNER else {
+                "downloadsPerDay": limits["familyDownloadsPerDay"], "playsPerDay": limits["familyPlaysPerDay"],
+            },
+            "today": {kind: today.get(kind, 0) for kind in ("download", "play", "ask")},
+            "listening": self._personal.listening_status(account),
+            "collections": {key: value for key, value in self._personal.collections(account).items() if key in ("revision", "updatedAt")},
+        }
+
+    def _get_account(self, url):
+        account = self._account()
+        if url.path == "/api/account/me":
+            self._send_json(self._account_info(account))
+        elif url.path == "/api/me/listening":
+            query = parse_qs(url.query, keep_blank_values=True)
+            self._send_json(self._personal.listening(
+                account, self._integer(query, "after", 0), self._integer(query, "limit", 1000),
+            ))
+        elif url.path == "/api/me/collections":
+            self._send_json(self._personal.collections(account))
+        elif url.path == "/api/accounts" and self._home_only():
+            rows = [{"id": OWNER, "name": "主账户（我）", "owner": True, "devices": []}, *self._accounts.panel_rows()]
+            for row in rows:
+                info = self._account_info(row["id"])
+                row.update(owner=row["id"] == OWNER, limits=info["limits"], today=info["today"])
+                row.update(self._personal.panel_status(row["id"]))
+            self._send_json({"accounts": rows})
+        elif url.path != "/api/accounts":
+            self._send_json({"error": "not_found"}, 404)
+
+    def _post_account(self, path):
+        try:
+            if path == "/api/account/login":
+                body = self._read_json(4096)
+                if body is not None:
+                    self._send_json(self._accounts.login(body.get("name"), body.get("password"), body.get("device")))
+            elif path == "/api/account/logout":
+                if self._account() == OWNER:
+                    self._send_json({"error": "not_a_device"}, 400)
+                else:
+                    self._accounts.logout(self.headers["Authorization"][7:])
+                    self._send_json({"ok": True})
+            elif path in ("/api/me/listening", "/api/me/collections"):
+                body = self._read_json((2 if path.endswith("/listening") else 6) * 1024 * 1024)
+                if body is not None:
+                    result = (
+                        self._personal.append(self._account(), body.get("events")) if path.endswith("/listening")
+                        else self._personal.save_collections(self._account(), body)
+                    )
+                    self._send_json(result)
+            elif path == "/api/accounts" or _ACCOUNT_ITEM.fullmatch(path):
+                if not self._home_only():
+                    return
+                body = self._read_json(4096)
+                if body is None:
+                    return
+                item = _ACCOUNT_ITEM.fullmatch(path)
+                if path == "/api/accounts":
+                    self._send_json(self._accounts.create(body.get("name"), body.get("password")))
+                elif item.group(2) is not None:
+                    self._send_json({"error": "not_found"}, 404)
+                else:
+                    if "enabled" in body and type(body["enabled"]) is not bool:
+                        raise AccountError("bad_request")
+                    if "password" in body:
+                        self._accounts.set_password(item.group(1), body["password"])
+                    if "enabled" in body:
+                        self._accounts.set_enabled(item.group(1), body["enabled"])
+                    self._send_json({"ok": True})
+            else:
+                self._send_json({"error": "not_found"}, 404)
+        except (AccountError, PersonalError) as error:
+            self._send_json({"error": error.code, **(error.details if isinstance(error, PersonalError) else {})}, error.status)
+
+    def _delete_account(self, path):
+        item = _ACCOUNT_ITEM.fullmatch(path)
+        if item is None:
+            self._send_json({"error": "not_found"}, 404)
+        elif self._home_only():
+            try:
+                if item.group(2) is not None:
+                    self._accounts.revoke_device(item.group(1), item.group(2))
+                else:
+                    self._accounts.delete(item.group(1))
+                    self._personal.delete_account_data(item.group(1))
+            except AccountError as error:
+                self._send_json({"error": error.code}, error.status)
+                return
+            self._send_json({"ok": True})
 
     def _get_source(self, path):
         if self._sources is None or self._resolver is None:
@@ -158,7 +292,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             elif path == "/api/source/limits":
                 self._send_json(self._resolver.limits())
             else:
-                self._send_json(self._resolver.usage())
+                usage = self._resolver.usage()
+                for day in usage["days"]:
+                    for row in day["accounts"]:
+                        row["name"] = self._accounts.name_of(row["account"]) if self._accounts is not None else (
+                            "主账户" if row["account"] == OWNER else "已删除的账户"
+                        )
+                self._send_json(usage)
 
     def _post_source(self, path):
         if self._sources is None or self._resolver is None:
@@ -213,7 +353,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             stream = self._resolver.open_stream(ticket, self.headers.get("Range"))
         except ResolveError as error:
             if error.code == "not_found" and not self._authorized():
-                self._send_json({"error": "unauthorized"}, 401)
+                self._reject_auth()
             else:
                 self._send_json({"error": error.code}, error.status)
             return
@@ -234,11 +374,18 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = unquote(urlsplit(self.path).path)
+        if not self._accounts_configured(path):
+            return
         if path.startswith(_STREAM_PREFIX):
+            if self.headers.get("Authorization", "").startswith("Bearer xyd_") and not self._authorized():
+                self._reject_auth()
+                return
             self._get_source(path)
             return
         if path not in ("/", "/index.html") and not self._authorized():
-            self._send_json({"error": "unauthorized"}, 401)
+            self._reject_auth()
+            return
+        if path in ("/api/logs", "/api/logs/download", "/api/llm") and not self._owner_only():
             return
         url = urlsplit(self.path)
         if url.path in ("/", "/index.html"):
@@ -252,6 +399,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+        elif url.path.startswith(("/api/account", "/api/me/")):
+            self._get_account(url)
         elif url.path in ("/api/logs", "/api/logs/download"):
             if self._data is None:
                 self._send_json({"error": "not_found"}, 404)
@@ -307,7 +456,17 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 if self._downloads is None:
                     self._send_json({"available": False, "jobs": []})
                 else:
-                    self._send_json({"available": self._downloads.available(), "jobs": self._downloads.snapshot()})
+                    account = self._account()
+                    jobs = self._downloads.snapshot()
+                    if account == OWNER:
+                        jobs = [{
+                            **job, "accountName": (
+                                self._accounts.name_of(job["account"]) if self._accounts is not None else "已删除的账户"
+                            ) if job["account"] != OWNER else "",
+                        } for job in jobs]
+                    else:
+                        jobs = [job for job in jobs if job["account"] == account]
+                    self._send_json({"available": self._downloads.available(), "jobs": jobs})
             elif url.path == "/api/llm" and self._llm is not None:
                 self._send_json(self._llm.status())
             else:
@@ -317,12 +476,20 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlsplit(self.path).path)
-        if path not in ("/", "/index.html") and not self._authorized():
-            self._send_json({"error": "unauthorized"}, 401)
+        if not self._accounts_configured(path):
+            return
+        if path not in ("/", "/index.html", "/api/account/login") and not self._authorized():
+            self._reject_auth()
+            return
+        if path in ("/api/llm", "/api/llm/test", "/api/scan", "/api/butler/artists", "/api/butler/songs") and not self._owner_only():
             return
         path = urlsplit(self.path).path
         if path.startswith("/api/"):
-            if path == "/api/access":
+            if path.startswith(("/api/account", "/api/me/")):
+                self._post_account(path)
+            elif path == "/api/access":
+                if not self._owner_only():
+                    return
                 if not self._is_trusted():
                     LOGGER.warning("SETTINGS access rejected addr=%s", self.client_address[0])
                     self._send_json({"error": "home_only"}, 403)
@@ -354,13 +521,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 if body is None:
                     return
                 if path == "/api/downloads/cancel":
-                    self._send_json({"ok": self._downloads.cancel(body.get("id"))})
+                    account = self._account()
+                    self._send_json({"ok": self._downloads.cancel(body.get("id"), None if account == OWNER else account)})
                     return
                 try:
                     if path == "/api/downloads/locate":
                         self._send_json({"directory": self._downloads.locate(body.get("name"))})
                     else:
-                        self._send_json({"id": self._downloads.submit(body)})
+                        self._send_json({"id": self._downloads.submit(body, self._account())})
                 except DownloadError as error:
                     self._send_json({"error": error.code}, error.status)
             elif path == "/api/llm" and self._llm is not None:
@@ -398,7 +566,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     self._send_json({"error": "bad_query"}, 400)
                     return
                 try:
-                    self._send_json(self._asker.ask(q.strip(), taste, part))
+                    answer = self._asker.ask(q.strip(), taste, part)
+                    if self._resolver is not None:
+                        self._resolver.ledger.note(self._account(), "ask")
+                    self._send_json(answer)
                 except AskError as error:
                     self._send_json({"error": error.code}, error.status)
             elif path in ("/api/butler/artists", "/api/butler/songs") and self._panel_available():
@@ -443,12 +614,17 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_DELETE(self):
         path = unquote(urlsplit(self.path).path)
+        if not self._accounts_configured(path):
+            return
         if path not in ("/", "/index.html") and not self._authorized():
-            self._send_json({"error": "unauthorized"}, 401)
+            self._reject_auth()
             return
         path = urlsplit(self.path).path
         if not path.startswith("/api/"):
             self.send_error(501, "Unsupported method ('DELETE')")
+            return
+        if path.startswith("/api/accounts"):
+            self._delete_account(path)
             return
         item = _SOURCE_ITEM.fullmatch(path)
         if item is None or item.group(2):
@@ -466,14 +642,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
 def make_server(
     out, port, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-    access=None, sources=None, resolver=None,
+    access=None, sources=None, resolver=None, accounts=None, personal=None,
 ):
     if access is None:
         access = AccessSettings(None, network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2")
     handler = functools.partial(
         _Handler, directory=str(out), data=data, state=state, index=index, asker=asker, butler=butler, llm=llm,
         downloads=downloads,
-        access=access, sources=sources, resolver=resolver,
+        access=access, sources=sources, resolver=resolver, accounts=accounts, personal=personal,
     )
     return http.server.ThreadingHTTPServer(("", port), handler)
 

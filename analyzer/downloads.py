@@ -166,7 +166,7 @@ class Downloads:
     def available(self):
         return self._root.is_dir() and os.access(self._root, os.W_OK)
 
-    def submit(self, body):
+    def submit(self, body, account="owner"):
         if not self.available():
             raise DownloadError("download_unconfigured", 503)
         url = _text(body.get("url"), 4000)
@@ -193,6 +193,7 @@ class Downloads:
             raise DownloadError("bad_request")
         job = {
             "id": uuid.uuid4().hex,
+            "account": account,
             "filename": _filename(body.get("filename")),
             "directory": _directory(body.get("directory", "")),
             "state": "queued", "received": 0, "total": 0, "error": "", "path": "",
@@ -216,22 +217,24 @@ class Downloads:
                     break
                 del self._jobs[old]
             LOGGER.info(
-                "DOWNLOAD-START id=%s host=%s dir=%s file=%s",
-                job["id"], job["host"], job["directory"], job["filename"],
+                "DOWNLOAD-START id=%s host=%s dir=%s file=%s account=%s",
+                job["id"], job["host"], job["directory"], job["filename"], account,
             )
             self._wake.notify()
         return job["id"]
 
     def snapshot(self):
         names = ("id", "filename", "directory", "state", "received", "total", "error", "path", "host",
-                 "createdAt", "finishedAt", "format", "durationMs", "sampleRate", "bitDepth", "bitRate", "sourceName")
+                 "createdAt", "finishedAt", "format", "durationMs", "sampleRate", "bitDepth", "bitRate", "sourceName", "account")
         with self._lock:
             return [{name: job[name] for name in names} for job in list(self._jobs.values())[::-1][:100]]
 
-    def cancel(self, job_id):
+    def cancel(self, job_id, account=None):
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None or job["state"] not in ("queued", "downloading"):
+                return False
+            if account is not None and job["account"] != account:
                 return False
             job["cancelled"] = True
             if job["state"] == "queued":

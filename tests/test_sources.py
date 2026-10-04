@@ -236,7 +236,8 @@ class _Downloads:
     def available(self):
         return True
 
-    def submit(self, job):
+    def submit(self, job, account="owner"):
+        self.account = account
         if self.error is not None:
             raise self.error
         self.jobs.append(job)
@@ -773,7 +774,8 @@ def test_resolver_cache_hits_call_no_source_and_count_a_play_once(tmp_path):
 
     clock.advance(CACHE_SECONDS)
     resolver.resolve(_song("kw", "1", "flac"), OWNER)
-    assert len(runner.calls) == 4 and _today(resolver) == (4, {"family-test": (0, 1), OWNER: (1, 2)})
+    # 同一首当天只算一次。
+    assert len(runner.calls) == 4 and _today(resolver) == (4, {"family-test": (0, 1), OWNER: (1, 1)})
 
 
 def test_resolver_counts_start_over_at_shanghai_midnight(tmp_path):
@@ -798,7 +800,7 @@ def test_resolver_counts_start_over_at_shanghai_midnight(tmp_path):
     usage.write_text(json.dumps(saved), encoding="utf-8")
     reopened = SourceLedger(tmp_path, clock)
     assert reopened.used_today() == {source_id: 1}
-    reopened.charge(OWNER, "play")
+    reopened.charge(OWNER, "play", "kw|1")
     # Only the last 31 days are kept.
     assert sorted(json.loads(usage.read_text(encoding="utf-8"))["days"]) == ["2026-10-04", "2026-10-05"]
 

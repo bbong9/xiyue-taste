@@ -356,6 +356,7 @@
         <button class="scan quiet" id="ai-open" type="button">AI 设置</button>
         <button class="scan quiet" id="access-open" type="button">连接设置</button>
         <button class="scan quiet" id="sources-open" type="button" hidden>音源</button>
+        <button class="scan quiet" id="accounts-open" type="button" hidden>家人账户</button>
         <button class="scan quiet" id="logs-open" type="button">日志</button>
         <button class="scan" id="scan" type="button">立即扫描</button>
       </div>
@@ -498,6 +499,7 @@
     </form>
     <p class="ai-result" id="access-result" role="status" hidden></p>
     <p class="ai-note">口令保存后不会再显示。先把它复制到 App 的 设置 → AI 助手 → 访问口令，再点保存。</p>
+    <p class="ai-note">这个口令是你（主账户）的；家人用“家人账户”里的名字和密码登录。</p>
     <p class="ai-note">在家不用口令；在外面要给 8790 端口做一个 https 外网地址，并在 App 里填上它和口令。</p>
   </aside>
   <aside class="drawer" id="logs-drawer" role="dialog" aria-modal="true" aria-labelledby="logs-title" aria-hidden="true">
@@ -544,7 +546,7 @@
       </div>
     </form>
     <p class="ai-result" id="limits-result" role="status" hidden></p>
-    <p class="ai-note">主账户不限；家人账户在分账户上线后生效。</p>
+    <p class="ai-note">主账户不限。同一首歌当天只算一次。</p>
     <h3>播放方式</h3>
     <ul class="dl" id="transport-list"></ul>
     <p class="ai-note">直连：手机自己去取音频。转发：这台 NAS 取了再传给手机。手机报告直连放不了时自动改成转发，7 天后再试直连。</p>
@@ -553,6 +555,25 @@
     <ul class="dl" id="usage-accounts"></ul>
     <h3>最近 7 天</h3>
     <ul class="dl" id="usage-days"></ul>
+  </aside>
+
+  <aside class="drawer" id="accounts-drawer" role="dialog" aria-modal="true" aria-labelledby="accounts-title" aria-hidden="true">
+    <button class="close" id="accounts-close" type="button" aria-label="关闭"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m3.5 3.5 9 9m0-9-9 9" stroke-linecap="round"/></svg></button>
+    <h2 class="d-title" id="accounts-title">家人账户</h2>
+    <p class="d-sub">家人用名字和密码在汐乐里登录</p>
+    <div id="accounts-list"></div>
+    <h3>新建</h3>
+    <form id="accounts-form">
+      <label class="field"><span>名字</span><input id="accounts-name" type="text" maxlength="20" autocomplete="off" required></label>
+      <label class="field"><span>密码</span><input id="accounts-password" type="text" minlength="8" maxlength="128" autocomplete="off" required></label>
+      <div class="ai-actions">
+        <button class="scan quiet" id="accounts-generate" type="button">生成一个</button>
+        <button class="scan" id="accounts-create" type="submit">新建</button>
+      </div>
+    </form>
+    <p class="ai-result" id="accounts-result" role="status" hidden></p>
+    <p class="ai-note">主账户就是你，不用建。家人在汐乐里填这台 NAS 的外网地址、名字和密码登录。</p>
+    <p class="ai-note">改密码会让这个人所有设备重新登录。家人的限额在“音源”里设置。</p>
   </aside>
 
   <script>
@@ -603,7 +624,7 @@
     }
     function offline(on) { $("offline").hidden = !on || !$("access-token-form").hidden; }
     function drawersClosed() {
-      return ["drawer", "ai-drawer", "access-drawer", "logs-drawer", "sources-drawer"].every(id => !$(id).classList.contains("open"));
+      return ["drawer", "ai-drawer", "access-drawer", "logs-drawer", "sources-drawer", "accounts-drawer"].every(id => !$(id).classList.contains("open"));
     }
     function relativeTime(value) {
       if (!value) return "—";
@@ -882,7 +903,7 @@
         const row = el("li", job.state === "done" ? "good" : job.state === "failed" ? "bad" : "");
         const name = el("div");
         const detail = (job.path || job.directory || "下载目录") + (job.sourceName ? ` · ${job.sourceName}` : "");
-        name.append(el("b", "", job.filename), el("small", "", detail));
+        name.append(el("b", "", job.filename + (job.accountName ? ` · ${job.accountName}` : "")), el("small", "", detail));
         let state = "排队中";
         if (job.state === "downloading") state = job.total ? `${Math.floor(job.received / job.total * 100)}% · ${megabytes(job.total)}` : megabytes(job.received);
         else if (job.state === "done") state = [job.format.toUpperCase(), job.bitDepth ? job.bitDepth + " bit" : "", megabytes(job.received)].filter(Boolean).join(" · ");
@@ -922,6 +943,7 @@
     }
 
     async function openDetail(index) {
+      if ($("accounts-drawer").classList.contains("open")) closeAccounts();
       const version = ++detailRequest;
       const drawer = $("drawer");
       if (!drawer.classList.contains("open")) previousFocus = document.activeElement;
@@ -1007,6 +1029,7 @@
       if (option) $("ai-model").placeholder = option.dataset.model;
     }
     async function openAI() {
+      if ($("accounts-drawer").classList.contains("open")) closeAccounts();
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("access-drawer").classList.contains("open")) closeAccess();
       if ($("logs-drawer").classList.contains("open")) closeLogs();
@@ -1104,6 +1127,7 @@
       $("access-notice").hidden = status.configured;
       accessHome = status.home;
       $("sources-open").hidden = !accessHome;
+      $("accounts-open").hidden = !accessHome;
       $("access-form").querySelectorAll("input, button").forEach(node => { node.disabled = !accessHome; });
       if (!accessHome) accessResult("只能在家里的网络下修改", "bad");
     }
@@ -1127,6 +1151,7 @@
       accessState(status);
     }
     async function openAccess() {
+      if ($("accounts-drawer").classList.contains("open")) closeAccounts();
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("ai-drawer").classList.contains("open")) closeAI();
       if ($("logs-drawer").classList.contains("open")) closeLogs();
@@ -1203,6 +1228,7 @@
       }
     }
     function openLogs() {
+      if ($("accounts-drawer").classList.contains("open")) closeAccounts();
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("ai-drawer").classList.contains("open")) closeAI();
       if ($("access-drawer").classList.contains("open")) closeAccess();
@@ -1244,6 +1270,162 @@
     });
 
     const platformNames = { kw: "酷我", kg: "酷狗", tx: "QQ 音乐", wy: "网易云", mg: "咪咕" };
+    let accountsFocus = null;
+    let accountsRequest = 0;
+    function accountsResult(text, kind) {
+      $("accounts-result").hidden = !text;
+      $("accounts-result").className = "ai-result" + (kind ? " " + kind : "");
+      $("accounts-result").textContent = text || "";
+    }
+    function accountFailure(error) {
+      return {
+        bad_name: "名字要填 1–20 个字，不能含斜线或控制字符，也不能叫 owner 或主账户",
+        bad_password: "密码要填 8–128 个可打印字符",
+        name_taken: "这个名字已经用了",
+        too_many_accounts: "最多建 20 个家人账户",
+        not_found: "账户或设备已经不在了",
+        home_only: "只能在家里的网络下管理",
+        owner_only: "只有主账户能管理",
+        accounts_unconfigured: "账户还没配置",
+      }[error.code] || "没保存成功";
+    }
+    async function changeAccount(path, method, body, message) {
+      try {
+        await api(path, { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+        accountsResult(message, "good");
+        await loadAccounts();
+        return true;
+      } catch (error) {
+        accountsResult(accountFailure(error), "bad");
+        return false;
+      }
+    }
+    function accountRow(account) {
+      const card = el("section", "card");
+      card.append(el("h3", "", account.name + (account.owner ? "" : account.enabled ? " · 启用" : " · 停用")));
+      const summary = account.collections.summary;
+      card.append(el("p", "ai-note", `收听 ${account.listening.total} 条`));
+      card.append(el("p", "ai-note", summary ? `喜欢 ${summary.liked} 首 · 歌单 ${summary.playlists} 个` : "还没同步"));
+      card.append(el("p", "ai-note", `最近同步 ${account.lastSyncAt ? new Date(account.lastSyncAt * 1000).toLocaleString("zh-CN") : "—"}`));
+      const limits = account.limits;
+      card.append(el("p", "ai-note", `今天 下载 ${account.today.download}${limits ? "/" + limits.downloadsPerDay : ""} · 播放 ${account.today.play}${limits ? "/" + limits.playsPerDay : ""} · AI ${account.today.ask}`));
+      if (account.owner) return card;
+      card.append(el("p", "ai-note", `设备 ${account.devices.length} 台`));
+      const actions = el("div", "ai-actions");
+      const passwordButton = el("button", "scan quiet", "改密码");
+      const toggle = el("button", "scan quiet", account.enabled ? "停用" : "启用");
+      const remove = el("button", "scan quiet", "删除");
+      for (const button of [passwordButton, toggle, remove]) button.type = "button";
+      actions.append(passwordButton, toggle, remove);
+      card.append(actions);
+      const form = el("form");
+      form.hidden = true;
+      const label = el("label", "field");
+      const password = el("input");
+      password.type = "text";
+      password.autocomplete = "off";
+      password.minLength = 8;
+      password.maxLength = 128;
+      password.required = true;
+      label.append(el("span", "", "新密码"), password);
+      const saveActions = el("div", "ai-actions");
+      const save = el("button", "scan", "保存");
+      save.type = "submit";
+      saveActions.append(save);
+      form.append(label, saveActions);
+      card.append(form);
+      passwordButton.addEventListener("click", () => { form.hidden = !form.hidden; if (!form.hidden) password.focus(); });
+      form.addEventListener("submit", async event => {
+        event.preventDefault();
+        save.disabled = true;
+        await changeAccount(`/api/accounts/${account.id}`, "POST", { password: password.value }, "已改，这个人的设备都要重新登录");
+        password.value = "";
+        save.disabled = false;
+      });
+      toggle.addEventListener("click", async () => {
+        toggle.disabled = true;
+        await changeAccount(`/api/accounts/${account.id}`, "POST", { enabled: !account.enabled }, account.enabled ? "已停用" : "已启用");
+        toggle.disabled = false;
+      });
+      remove.addEventListener("click", async () => {
+        if (!confirm("删除后，这个人的收听记录、喜欢和歌单都会从 NAS 上删掉，不能恢复。")) return;
+        remove.disabled = true;
+        await changeAccount(`/api/accounts/${account.id}`, "DELETE", undefined, "已删除");
+        remove.disabled = false;
+      });
+      const devices = el("details");
+      devices.append(el("summary", "", "设备列表"));
+      const list = el("ul", "dl");
+      for (const device of account.devices) {
+        const row = el("li");
+        const text = el("div");
+        text.append(el("b", "", device.name), el("small", "", `最近使用 ${new Date(device.lastSeenAt * 1000).toLocaleString("zh-CN")}`));
+        const revoke = el("button", "scan quiet", "下线");
+        revoke.type = "button";
+        revoke.addEventListener("click", async () => {
+          revoke.disabled = true;
+          await changeAccount(`/api/accounts/${account.id}/devices/${device.id}`, "DELETE", undefined, "设备已下线");
+          revoke.disabled = false;
+        });
+        row.append(text, revoke);
+        list.append(row);
+      }
+      devices.append(list);
+      card.append(devices);
+      return card;
+    }
+    async function loadAccounts() {
+      const version = ++accountsRequest;
+      try {
+        const { accounts } = await api("/api/accounts");
+        if (version === accountsRequest) $("accounts-list").replaceChildren(...accounts.map(accountRow));
+      } catch (error) {
+        if (version === accountsRequest) accountsResult(accountFailure(error), "bad");
+      }
+    }
+    function openAccounts() {
+      if ($("drawer").classList.contains("open")) closeDetail();
+      if ($("ai-drawer").classList.contains("open")) closeAI();
+      if ($("access-drawer").classList.contains("open")) closeAccess();
+      if ($("logs-drawer").classList.contains("open")) closeLogs();
+      if ($("sources-drawer").classList.contains("open")) closeSources();
+      accountsFocus = document.activeElement;
+      accountsResult("");
+      $("scrim").hidden = false;
+      requestAnimationFrame(() => $("scrim").classList.add("show"));
+      $("accounts-drawer").classList.add("open");
+      $("accounts-drawer").setAttribute("aria-hidden", "false");
+      loadAccounts();
+    }
+    function closeAccounts() {
+      ++accountsRequest;
+      $("accounts-password").value = "";
+      $("accounts-list").replaceChildren();
+      $("accounts-drawer").classList.remove("open");
+      $("accounts-drawer").setAttribute("aria-hidden", "true");
+      $("scrim").classList.remove("show");
+      setTimeout(() => {
+        if (drawersClosed()) $("scrim").hidden = true;
+      }, 300);
+      accountsFocus?.focus({ preventScroll: true });
+    }
+    $("accounts-open").addEventListener("click", openAccounts);
+    $("accounts-close").addEventListener("click", closeAccounts);
+    $("accounts-generate").addEventListener("click", () => {
+      const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+      const bytes = crypto.getRandomValues(new Uint8Array(12));
+      $("accounts-password").value = Array.from(bytes, byte => alphabet[byte % alphabet.length]).join("");
+    });
+    $("accounts-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      $("accounts-create").disabled = true;
+      const saved = await changeAccount("/api/accounts", "POST", {
+        name: $("accounts-name").value, password: $("accounts-password").value,
+      }, "已新建");
+      if (saved) $("accounts-form").reset();
+      $("accounts-create").disabled = false;
+    });
+
     const sourceErrors = {
       initialization_timeout: "初始化超时", initialization_failed: "没声明能用的平台", script_failed: "脚本出错",
       protocol_violation: "声明的格式不对", runner_unavailable: "运行器没启动", runner_crashed: "运行器崩溃了",
@@ -1466,7 +1648,7 @@
       }) : [emptyRow("今天还没调用过音源")]));
       $("usage-accounts").replaceChildren(...today.accounts.map(item => {
         const row = el("li");
-        row.append(el("b", "", item.account === "owner" ? "主账户（不限）" : item.account), el("span", "", `下载 ${item.download} · 播放 ${item.play}`));
+        row.append(el("b", "", item.name), el("span", "", `下载 ${item.download} · 播放 ${item.play} · AI ${item.ask}`));
         return row;
       }));
       $("usage-days").replaceChildren(...usage.days.map(day => {
@@ -1501,6 +1683,7 @@
       }
     }
     function openSources() {
+      if ($("accounts-drawer").classList.contains("open")) closeAccounts();
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("ai-drawer").classList.contains("open")) closeAI();
       if ($("access-drawer").classList.contains("open")) closeAccess();
@@ -1657,12 +1840,17 @@
     $("failures").addEventListener("toggle", () => { if ($("failures").open) loadFailures().catch(() => offline(true)); });
     $("d-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", () => {
-      if ($("sources-drawer").classList.contains("open")) closeSources();
+      if ($("accounts-drawer").classList.contains("open")) closeAccounts();
+      else if ($("sources-drawer").classList.contains("open")) closeSources();
       else if ($("logs-drawer").classList.contains("open")) closeLogs();
       else if ($("access-drawer").classList.contains("open")) closeAccess();
       else if ($("ai-drawer").classList.contains("open")) closeAI(); else closeDetail();
     });
     document.addEventListener("keydown", event => {
+      if ($("accounts-drawer").classList.contains("open")) {
+        if (event.key === "Escape") closeAccounts();
+        return;
+      }
       if ($("sources-drawer").classList.contains("open")) {
         if (event.key === "Escape") closeSources();
         return;
