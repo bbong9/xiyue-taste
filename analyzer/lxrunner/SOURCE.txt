@@ -1,0 +1,19 @@
+LX Mobile preload provenance
+
+Project: lyswhut/lx-music-mobile
+Fixed commit: d2956044533150057d65bfeaf2ae0fb5179433f5
+Adopted file: android/app/src/main/assets/script/user-api-preload.js
+License: Apache-2.0 (see Apache-2.0-LICENSE.txt)
+
+iOS adaptation:
+- The fixed upstream preload is adapted for iOS; it is not byte-for-byte unchanged.
+- Existing adaptations declare extended online quality identifiers and the
+  host-private xiyueMusicFreeSearch operation.
+- 2026-09-14: musicUrl response length changes from 2048 to 16384 characters
+  to match LXNetworkPolicy.maximumURLBytes; native validation additionally
+  enforces the UTF-8 byte limit. Scheme and network address checks remain.
+- iOS supplies the native bridge globals required by the preload.
+- A single WKWebView JavaScript context owns preload, user script, callbacks,
+  timers, and request state for the runtime lifetime.
+- No worker supervisor or alternate lx protocol is introduced.
+- 容器运行器用的是同一份 iOS 改编版，未再改动。

@@ -280,6 +280,14 @@
     .ai-result.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
     .ai-note { margin: 22px 0 0; color: var(--faint); font-size: 12px; line-height: 1.7; }
     .logs-text { font: 12px/1.6 var(--mono); color: var(--muted); max-height: 60vh; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .dl li.source { flex-wrap: wrap; }
+    .dl li.source > div:first-child { flex: 1; min-width: 0; }
+    .row-actions { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; }
+    .row-actions input {
+      width: 104px; height: 34px; padding: 0 14px; border-radius: 999px; outline: none;
+      border: 1px solid var(--line); background: var(--panel); font-size: 13px; font-variant-numeric: tabular-nums;
+    }
+    .row-actions input:focus { border-color: color-mix(in srgb, var(--tide) 60%, transparent); box-shadow: 0 0 0 4px var(--tide-soft); }
     .drawer h3 { margin: 28px 0 8px; font: 600 16px var(--serif); letter-spacing: .2em; }
     .drawer h3 small { font: 12px var(--sans); color: var(--muted); letter-spacing: 0; margin-left: 8px; }
     .near-list { list-style: none; margin: 0 -12px; padding: 0; }
@@ -347,6 +355,7 @@
         <span class="status" id="status"><i></i><span id="status-text">连接中</span></span>
         <button class="scan quiet" id="ai-open" type="button">AI 设置</button>
         <button class="scan quiet" id="access-open" type="button">连接设置</button>
+        <button class="scan quiet" id="sources-open" type="button" hidden>音源</button>
         <button class="scan quiet" id="logs-open" type="button">日志</button>
         <button class="scan" id="scan" type="button">立即扫描</button>
       </div>
@@ -501,6 +510,42 @@
       <button class="scan" id="logs-download" type="button">下载日志</button>
     </div>
   </aside>
+  <aside class="drawer" id="sources-drawer" role="dialog" aria-modal="true" aria-labelledby="sources-title" aria-hidden="true">
+    <button class="close" id="sources-close" type="button" aria-label="关闭"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m3.5 3.5 9 9m0-9-9 9" stroke-linecap="round"/></svg></button>
+    <p class="eyebrow">在线播放和下载</p>
+    <h2 class="d-title" id="sources-title">音源</h2>
+    <p class="d-sub" id="sources-today">正在读取…</p>
+    <h3>音源列表<small id="sources-count"></small></h3>
+    <ul class="dl" id="sources-list"></ul>
+    <div class="ai-actions">
+      <button class="scan" id="sources-add" type="button">添加音源</button>
+      <input id="sources-file" type="file" accept=".js,text/javascript,application/javascript" hidden>
+    </div>
+    <p class="ai-result" id="sources-result" role="status" hidden></p>
+    <p class="ai-note">脚本只存在这台 NAS 上，手机拿不到。每个音源每天的额度按调用次数算，几个音源轮着用。</p>
+    <h3>家人限额</h3>
+    <form id="limits-form">
+      <label class="field"><span>每人每天下载（首）</span>
+        <input id="limits-downloads" type="number" min="0" max="10000" step="1" inputmode="numeric" required>
+      </label>
+      <label class="field"><span>每人每天播放（首）</span>
+        <input id="limits-plays" type="number" min="0" max="10000" step="1" inputmode="numeric" required>
+      </label>
+      <div class="ai-actions">
+        <button class="scan" id="limits-save" type="submit">保存</button>
+      </div>
+    </form>
+    <p class="ai-result" id="limits-result" role="status" hidden></p>
+    <p class="ai-note">主账户不限；家人账户在分账户上线后生效。</p>
+    <h3>播放方式</h3>
+    <ul class="dl" id="transport-list"></ul>
+    <p class="ai-note">直连：手机自己去取音频。转发：这台 NAS 取了再传给手机。手机报告直连放不了时自动改成转发，7 天后再试直连。</p>
+    <h3>今天用量</h3>
+    <ul class="dl" id="usage-sources"></ul>
+    <ul class="dl" id="usage-accounts"></ul>
+    <h3>最近 7 天</h3>
+    <ul class="dl" id="usage-days"></ul>
+  </aside>
 
   <script>
     const $ = id => document.getElementById(id);
@@ -544,6 +589,9 @@
       return asBlob ? response.blob() : response.json();
     }
     function offline(on) { $("offline").hidden = !on || !$("access-token-form").hidden; }
+    function drawersClosed() {
+      return ["drawer", "ai-drawer", "access-drawer", "logs-drawer", "sources-drawer"].every(id => !$(id).classList.contains("open"));
+    }
     function relativeTime(value) {
       if (!value) return "—";
       const seconds = (new Date(value).getTime() - Date.now()) / 1000;
@@ -923,7 +971,7 @@
       $("drawer").classList.remove("open");
       $("drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
-      setTimeout(() => { if (!$("drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("access-drawer").classList.contains("open") && !$("logs-drawer").classList.contains("open")) $("scrim").hidden = true; }, 300);
+      setTimeout(() => { if (drawersClosed()) $("scrim").hidden = true; }, 300);
       selected = null;
       highlight();
       previousFocus?.focus({ preventScroll: true });
@@ -948,6 +996,7 @@
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("access-drawer").classList.contains("open")) closeAccess();
       if ($("logs-drawer").classList.contains("open")) closeLogs();
+      if ($("sources-drawer").classList.contains("open")) closeSources();
       aiFocus = document.activeElement;
       aiResult("");
       $("ai-key").value = "";
@@ -970,7 +1019,7 @@
       $("ai-drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
       setTimeout(() => {
-        if (!$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open") && !$("access-drawer").classList.contains("open") && !$("logs-drawer").classList.contains("open")) $("scrim").hidden = true;
+        if (drawersClosed()) $("scrim").hidden = true;
       }, 300);
       aiFocus?.focus({ preventScroll: true });
     }
@@ -1040,6 +1089,7 @@
       $("access-state").textContent = status.configured ? `已设置 · 口令${status.tokenSet ? "已设" : "未设"}` : "还没设置";
       $("access-notice").hidden = status.configured;
       accessHome = status.home;
+      $("sources-open").hidden = !accessHome;
       $("access-form").querySelectorAll("input, button").forEach(node => { node.disabled = !accessHome; });
       if (!accessHome) accessResult("只能在家里的网络下修改", "bad");
     }
@@ -1066,6 +1116,7 @@
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("ai-drawer").classList.contains("open")) closeAI();
       if ($("logs-drawer").classList.contains("open")) closeLogs();
+      if ($("sources-drawer").classList.contains("open")) closeSources();
       accessFocus = document.activeElement;
       accessResult("");
       $("access-key").value = "";
@@ -1084,7 +1135,7 @@
       $("access-drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
       setTimeout(() => {
-        if (!$("access-drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open") && !$("logs-drawer").classList.contains("open")) $("scrim").hidden = true;
+        if (drawersClosed()) $("scrim").hidden = true;
       }, 300);
       accessFocus?.focus({ preventScroll: true });
     }
@@ -1141,6 +1192,7 @@
       if ($("drawer").classList.contains("open")) closeDetail();
       if ($("ai-drawer").classList.contains("open")) closeAI();
       if ($("access-drawer").classList.contains("open")) closeAccess();
+      if ($("sources-drawer").classList.contains("open")) closeSources();
       logsFocus = document.activeElement;
       $("scrim").hidden = false;
       requestAnimationFrame(() => $("scrim").classList.add("show"));
@@ -1153,7 +1205,7 @@
       $("logs-drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
       setTimeout(() => {
-        if (!$("logs-drawer").classList.contains("open") && !$("access-drawer").classList.contains("open") && !$("ai-drawer").classList.contains("open") && !$("drawer").classList.contains("open")) $("scrim").hidden = true;
+        if (drawersClosed()) $("scrim").hidden = true;
       }, 300);
       logsFocus?.focus({ preventScroll: true });
     }
@@ -1174,6 +1226,291 @@
         $("logs-text").textContent = "下载日志失败";
       } finally {
         $("logs-download").disabled = false;
+      }
+    });
+
+    const platformNames = { kw: "酷我", kg: "酷狗", tx: "QQ 音乐", wy: "网易云", mg: "咪咕" };
+    const sourceErrors = {
+      initialization_timeout: "初始化超时", initialization_failed: "没声明能用的平台", script_failed: "脚本出错",
+      protocol_violation: "声明的格式不对", runner_unavailable: "运行器没启动", runner_crashed: "运行器崩溃了",
+      cancelled: "被打断了", script_missing: "脚本文件不见了", not_loaded: "没加载上", timeout: "超时",
+      invalid_result: "没给出地址", bad_address: "给的地址不能用", unplayable_format: "给的是加密或 ogg 格式",
+      unsupported_quality: "没有 320k", unavailable: "没加载",
+    };
+    let sourcesFocus = null;
+    let sourcesRequest = 0;
+    const sourceNotes = new Map();
+    function sourceReason(code) { return sourceErrors[code] || code; }
+    function clockTime(seconds) {
+      return new Date(seconds * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+    }
+    function sourcesResult(text, kind) {
+      $("sources-result").hidden = !text;
+      $("sources-result").className = "ai-result" + (kind ? " " + kind : "");
+      $("sources-result").textContent = text || "";
+    }
+    function limitsResult(text, kind) {
+      $("limits-result").hidden = !text;
+      $("limits-result").className = "ai-result" + (kind ? " " + kind : "");
+      $("limits-result").textContent = text || "";
+    }
+    function button(label, onClick) {
+      const node = el("button", "scan quiet", label);
+      node.type = "button";
+      node.addEventListener("click", onClick);
+      return node;
+    }
+    function emptyRow(text) {
+      const row = el("li");
+      row.append(el("small", "", text));
+      return row;
+    }
+    function sourceState(source, runner) {
+      if (source.loadError) return [`加载失败：${sourceReason(source.loadError)}` + (source.enabled ? "" : " · 已停用"), true];
+      if (!source.enabled) return ["已停用", false];
+      if (!runner) return ["运行器没启动", true];
+      if (source.cooldownUntil) return [`冷却到 ${clockTime(source.cooldownUntil)}`, true];
+      if (!source.loaded) return ["正在加载", false];
+      if (source.failures) return [`正常 · 10 分钟内失败 ${source.failures} 次（${sourceReason(source.lastError)}）`, false];
+      return ["正常", false];
+    }
+    async function changeSource(id, body) {
+      try {
+        await api(`/api/sources/${id}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        });
+        sourcesResult("");
+      } catch (error) {
+        sourcesResult(error.message === "403" ? "只能在家里的网络下修改" : error.message === "400" ? "额度要填 0 到 100000 的整数" : "没改成", "bad");
+      }
+      await loadSources();
+    }
+    async function testSource(source) {
+      sourceNotes.set(source.id, "正在试，最长要半分钟左右…");
+      renderSources(lastSources);
+      let note;
+      try {
+        const { results } = await api(`/api/sources/${source.id}/test`, { method: "POST" });
+        note = results.length ? results.map(item => `${platformNames[item.platform] || item.platform}：` + (
+          item.ok ? `成功，${(item.ms / 1000).toFixed(1)} 秒，${item.host}` : `失败，${sourceReason(item.error)}`
+        )).join("；") : "它没有能试的平台（只试酷我、QQ 音乐、酷狗、网易云）";
+      } catch (error) {
+        note = error.message === "409" ? "没加载上，试不了" : error.message === "403" ? "只能在家里的网络下试" : "没试成";
+      }
+      sourceNotes.set(source.id, note);
+      await loadSources();
+    }
+    function sourceRow(source, index, count, runner) {
+      const [state, bad] = sourceState(source, runner);
+      const row = el("li", "source" + (bad ? " bad" : ""));
+      const name = el("div");
+      const platforms = Object.keys(source.platforms).map(platform => platformNames[platform] || platform).join("、");
+      name.append(el("b", "", `${source.name} ${source.version}`), el("small", "", [platforms, state].filter(Boolean).join(" · ")));
+      if (sourceNotes.has(source.id)) name.append(el("small", "", sourceNotes.get(source.id)));
+      row.append(name, el("span", "", `${source.used} / ${source.dailyQuota}`));
+      const quota = el("input");
+      quota.type = "number";
+      quota.min = "0";
+      quota.max = "100000";
+      quota.step = "1";
+      quota.inputMode = "numeric";
+      quota.value = String(source.dailyQuota);
+      quota.title = "每天额度（0 = 暂停）";
+      quota.setAttribute("aria-label", `${source.name} 每天额度`);
+      quota.addEventListener("change", () => {
+        const value = Number(quota.value);
+        if (!quota.checkValidity() || !Number.isInteger(value)) {
+          sourcesResult("额度要填 0 到 100000 的整数", "bad");
+          quota.value = String(source.dailyQuota);
+          return;
+        }
+        if (value !== source.dailyQuota) changeSource(source.id, { dailyQuota: value });
+      });
+      const up = button("上移", () => changeSource(source.id, { order: index - 1 }));
+      up.disabled = index === 0;
+      const down = button("下移", () => changeSource(source.id, { order: index + 1 }));
+      down.disabled = index === count - 1;
+      const test = button("试一下", () => testSource(source));
+      test.disabled = !source.enabled || sourceNotes.get(source.id) === "正在试，最长要半分钟左右…";
+      const remove = button("删除", async () => {
+        if (remove.dataset.armed !== "1") {
+          remove.dataset.armed = "1";
+          remove.textContent = "确认删除";
+          setTimeout(() => { remove.dataset.armed = ""; remove.textContent = "删除"; }, 4000);
+          return;
+        }
+        remove.disabled = true;
+        try {
+          await api(`/api/sources/${source.id}`, { method: "DELETE" });
+          sourceNotes.delete(source.id);
+          sourcesResult(`已删除 ${source.name}`, "good");
+        } catch (error) {
+          sourcesResult(error.message === "403" ? "只能在家里的网络下删除" : "没删成", "bad");
+        }
+        await loadSources();
+      });
+      const actions = el("div", "row-actions");
+      actions.append(button(source.enabled ? "停用" : "启用", () => changeSource(source.id, { enabled: !source.enabled })), quota, up, down, test, remove);
+      row.append(actions);
+      return row;
+    }
+    let lastSources = { runner: true, sources: [] };
+    function renderSources(list) {
+      lastSources = list;
+      const count = list.sources.length;
+      $("sources-count").textContent = count ? `${count} 个` : "";
+      $("sources-list").replaceChildren(...(count
+        ? list.sources.map((source, index) => sourceRow(source, index, count, list.runner))
+        : [emptyRow("还没有音源。添加一个 LX 音源脚本（.js），手机就能通过这台 NAS 在线播放和下载。")]));
+    }
+    function renderTransports(transports) {
+      $("transport-list").replaceChildren(...transports.map(item => {
+        const row = el("li", "source");
+        const name = el("div");
+        const origin = item.origin === "reported"
+          ? `手机报告直连放不了，${new Date(item.until * 1000).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })} 后再试直连`
+          : item.origin === "manual" ? "手动设置" : "默认";
+        name.append(el("b", "", platformNames[item.platform] || item.platform), el("small", "", origin));
+        row.append(name, el("span", "", item.transport === "relay" ? "转发" : "直连"));
+        const other = item.transport === "relay" ? "direct" : "relay";
+        const actions = el("div", "row-actions");
+        actions.append(button(other === "relay" ? "改成转发" : "改成直连", () => setTransport(item.platform, other)));
+        if (item.origin !== "default") {
+          actions.append(button(`恢复默认（${item.default === "relay" ? "转发" : "直连"}）`, () => setTransport(item.platform, "default")));
+        }
+        row.append(actions);
+        return row;
+      }));
+    }
+    function renderLimits(limits, fill) {
+      if (fill) {
+        $("limits-downloads").value = String(limits.familyDownloadsPerDay);
+        $("limits-plays").value = String(limits.familyPlaysPerDay);
+      }
+      renderTransports(limits.transports);
+    }
+    function renderUsage(usage) {
+      const today = usage.days[0];
+      $("sources-today").textContent = `今天 已用 ${today.used} / 合计额度 ${usage.quota}` + (lastSources.runner ? "" : " · 运行器没启动");
+      $("usage-sources").replaceChildren(...(today.sources.length ? today.sources.map(item => {
+        const row = el("li");
+        row.append(el("b", "", item.name || "已删除的音源"), el("span", "", `${item.used} 次`));
+        return row;
+      }) : [emptyRow("今天还没调用过音源")]));
+      $("usage-accounts").replaceChildren(...today.accounts.map(item => {
+        const row = el("li");
+        row.append(el("b", "", item.account === "owner" ? "主账户（不限）" : item.account), el("span", "", `下载 ${item.download} · 播放 ${item.play}`));
+        return row;
+      }));
+      $("usage-days").replaceChildren(...usage.days.map(day => {
+        const row = el("li");
+        row.append(el("b", "", day.date.slice(5)), el("span", "", `${day.used} 次`));
+        return row;
+      }));
+    }
+    async function loadSources(fill = false) {
+      const version = ++sourcesRequest;
+      try {
+        const [list, limits, usage] = await Promise.all([api("/api/sources"), api("/api/source/limits"), api("/api/source/usage")]);
+        if (version !== sourcesRequest) return;
+        renderSources(list);
+        renderLimits(limits, fill);
+        renderUsage(usage);
+      } catch (error) {
+        if (version !== sourcesRequest) return;
+        $("sources-today").textContent = {
+          "403": "只能在家里的网络下查看", "404": "这个版本的容器还不支持音源", "503": "音源功能没有启动",
+        }[error.message] || "读不到音源";
+      }
+    }
+    async function setTransport(platform, value) {
+      try {
+        renderLimits(await api("/api/source/limits", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ transports: { [platform]: value } }),
+        }), false);
+        limitsResult("");
+      } catch (error) {
+        limitsResult(error.message === "403" ? "只能在家里的网络下修改" : "播放方式没改成", "bad");
+      }
+    }
+    function openSources() {
+      if ($("drawer").classList.contains("open")) closeDetail();
+      if ($("ai-drawer").classList.contains("open")) closeAI();
+      if ($("access-drawer").classList.contains("open")) closeAccess();
+      if ($("logs-drawer").classList.contains("open")) closeLogs();
+      sourcesFocus = document.activeElement;
+      sourcesResult("");
+      limitsResult("");
+      sourceNotes.clear();
+      $("scrim").hidden = false;
+      requestAnimationFrame(() => $("scrim").classList.add("show"));
+      $("sources-drawer").classList.add("open");
+      $("sources-drawer").setAttribute("aria-hidden", "false");
+      loadSources(true);
+    }
+    function closeSources() {
+      ++sourcesRequest;
+      $("sources-drawer").classList.remove("open");
+      $("sources-drawer").setAttribute("aria-hidden", "true");
+      $("scrim").classList.remove("show");
+      setTimeout(() => {
+        if (drawersClosed()) $("scrim").hidden = true;
+      }, 300);
+      sourcesFocus?.focus({ preventScroll: true });
+    }
+    $("sources-open").addEventListener("click", openSources);
+    $("sources-close").addEventListener("click", closeSources);
+    $("sources-add").addEventListener("click", () => $("sources-file").click());
+    $("sources-file").addEventListener("change", async () => {
+      const file = $("sources-file").files[0];
+      $("sources-file").value = "";
+      if (!file) return;
+      if (file.size > 1048576) {
+        sourcesResult("脚本太大，不能超过 1 MB", "bad");
+        return;
+      }
+      let script;
+      try {
+        script = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
+      } catch {
+        sourcesResult("脚本要是 UTF-8 编码的文本", "bad");
+        return;
+      }
+      $("sources-add").disabled = true;
+      sourcesResult("正在添加并加载…");
+      try {
+        const source = await api("/api/sources", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ script }),
+        });
+        if (source.enabled) sourcesResult(`已添加 ${source.name} ${source.version}`, "good");
+        else sourcesResult(`已添加，但加载失败：${sourceReason(source.loadError)}`, "bad");
+      } catch (error) {
+        sourcesResult({
+          "400": "不是能用的音源脚本：开头的注释里要有 @name 和 @version", "403": "只能在家里的网络下添加",
+          "409": "这个音源已经添加过了", "413": "脚本太大，不能超过 1 MB",
+        }[error.message] || "添加失败", "bad");
+      } finally {
+        $("sources-add").disabled = false;
+      }
+      await loadSources();
+    });
+    $("limits-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      if (!$("limits-form").reportValidity()) return;
+      const body = {
+        familyDownloadsPerDay: Number($("limits-downloads").value), familyPlaysPerDay: Number($("limits-plays").value),
+      };
+      $("limits-save").disabled = true;
+      limitsResult("正在保存…");
+      try {
+        renderLimits(await api("/api/source/limits", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        }), true);
+        limitsResult("已保存", "good");
+      } catch (error) {
+        limitsResult(error.message === "400" ? "要填 0 到 10000 的整数" : error.message === "403" ? "只能在家里的网络下修改" : "保存失败", "bad");
+      } finally {
+        $("limits-save").disabled = false;
       }
     });
 
@@ -1209,11 +1546,16 @@
     $("failures").addEventListener("toggle", () => { if ($("failures").open) loadFailures().catch(() => offline(true)); });
     $("d-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", () => {
-      if ($("logs-drawer").classList.contains("open")) closeLogs();
+      if ($("sources-drawer").classList.contains("open")) closeSources();
+      else if ($("logs-drawer").classList.contains("open")) closeLogs();
       else if ($("access-drawer").classList.contains("open")) closeAccess();
       else if ($("ai-drawer").classList.contains("open")) closeAI(); else closeDetail();
     });
     document.addEventListener("keydown", event => {
+      if ($("sources-drawer").classList.contains("open")) {
+        if (event.key === "Escape") closeSources();
+        return;
+      }
       if ($("logs-drawer").classList.contains("open")) {
         if (event.key === "Escape") closeLogs();
         return;

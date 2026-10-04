@@ -9,11 +9,23 @@ from .access import AccessSettings
 from .ask import Asker
 from .butler import Butler
 from .downloads import Downloads
+from .lxhost import Runner
 from .panel import OutputIndex, PanelState
 from .log import LOGGER
+from .resolver import Resolver
 from .scan import probe_worker, scan
 from .serve import make_server
 from .settings import LLMSettings
+from .sources import SourceStore
+
+
+def _run_sources(runner, sources):
+    """Starts the source runner; every 10 minutes, enabled sources whose load failed get another try."""
+    if not runner.start():
+        return
+    while True:
+        time.sleep(600)
+        sources.retry_failed()
 
 
 def main():
@@ -76,10 +88,15 @@ def main():
         llm = LLMSettings(
             os.path.join(args.data, "llm-settings.json"), api_key, base_url, model, targets=(asker, butler),
         )
+        runner = Runner()
+        sources = SourceStore(args.data, runner)
+        resolver = Resolver(sources, runner, args.data)
+        runner.on_ready = sources.reload_all
+        threading.Thread(target=_run_sources, args=(runner, sources), name="sources", daemon=True).start()
         server = make_server(
             args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler, llm=llm,
             downloads=Downloads(args.downloads),
-            access=access,
+            access=access, sources=sources, resolver=resolver,
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
         LOGGER.info("Serving on port %s.", args.port)

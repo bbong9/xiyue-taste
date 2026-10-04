@@ -3,6 +3,7 @@ import functools
 import http.server
 import ipaddress
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -13,9 +14,13 @@ from .access import AccessError, AccessSettings
 from .ask import ASK_PARTS, AskError
 from .downloads import DownloadError
 from .log import LOGGER
+from .resolver import OWNER, ResolveError
 from .settings import SettingsError
+from .sources import SourceError
 
 
+_SOURCE_ITEM = re.compile(r"/api/sources/([0-9a-f]{16})(/test)?")
+_STREAM_PREFIX = "/api/source/stream/"
 _auth_rejections = {}
 _auth_rejections_lock = threading.Lock()
 
@@ -30,9 +35,13 @@ def _log_auth_reject(address, path, headers):
         if len(_auth_rejections) > 1000:
             _auth_rejections.clear()
             _auth_rejections[address] = now
+    shown = urlsplit(path).path
+    if unquote(shown).startswith(_STREAM_PREFIX.rstrip("/")):
+        # A relay path carries its ticket.
+        shown = _STREAM_PREFIX + "-"
     LOGGER.warning(
         "AUTH-REJECT addr=%s path=%s forwarded=%s token=%s",
-        address, urlsplit(path).path,
+        address, shown,
         "是" if any(header in headers for header in ("X-Forwarded-For", "X-Real-IP", "Forwarded")) else "否",
         "带了" if headers.get("Authorization") else "没带",
     )
@@ -43,7 +52,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def __init__(
         self, *args, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-        access=None, **kwargs,
+        access=None, sources=None, resolver=None, **kwargs,
     ):
         self._data = data
         self._state = state
@@ -53,6 +62,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self._llm = llm
         self._downloads = downloads
         self._access = access
+        self._sources = sources
+        self._resolver = resolver
         super().__init__(*args, **kwargs)
 
     def send_response(self, code, message=None):
@@ -120,6 +131,93 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         except ValueError:
             return default
 
+    def _account(self):
+        # Every authorized caller is the owner until family accounts arrive (card 47).
+        return OWNER
+
+    def _home_only(self):
+        """The sources are seen and changed at home only, like the connection settings."""
+        if self._is_trusted():
+            return True
+        LOGGER.warning("SOURCE-PANEL rejected addr=%s", self.client_address[0])
+        self._send_json({"error": "home_only"}, 403)
+        return False
+
+    def _get_source(self, path):
+        if self._sources is None or self._resolver is None:
+            self._send_json({"error": "source_unconfigured"}, 503)
+        elif path.startswith(_STREAM_PREFIX):
+            self._relay(path[len(_STREAM_PREFIX):])
+        elif path not in ("/api/sources", "/api/source/limits", "/api/source/usage"):
+            self._send_json({"error": "not_found"}, 404)
+        elif self._home_only():
+            if path == "/api/sources":
+                self._send_json(self._resolver.panel_sources())
+            elif path == "/api/source/limits":
+                self._send_json(self._resolver.limits())
+            else:
+                self._send_json(self._resolver.usage())
+
+    def _post_source(self, path):
+        if self._sources is None or self._resolver is None:
+            self._send_json({"error": "source_unconfigured"}, 503)
+            return
+        item = _SOURCE_ITEM.fullmatch(path)
+        try:
+            if path == "/api/source/resolve":
+                body = self._read_json(256 * 1024)
+                if body is not None:
+                    self._send_json(self._resolver.resolve(body, self._account()))
+            elif path == "/api/source/download":
+                body = self._read_json(6 * 1024 * 1024)
+                if body is not None:
+                    self._send_json(self._resolver.download(body, self._account(), self._downloads))
+            elif path == "/api/source/transport":
+                body = self._read_json(4096)
+                if body is not None:
+                    self._send_json(self._resolver.report_transport(body))
+            elif path not in ("/api/sources", "/api/source/limits") and item is None:
+                self._send_json({"error": "not_found"}, 404)
+            elif not self._home_only():
+                return
+            elif item is not None and item.group(2):
+                self._send_json(self._resolver.test_source(item.group(1)))
+            else:
+                # A script is at most 1 MiB, but JSON may spell a byte in six.
+                body = self._read_json(6 * 1024 * 1024 if path == "/api/sources" else 4096)
+                if body is None:
+                    return
+                if path == "/api/sources":
+                    self._send_json(self._sources.add(body.get("script")))
+                elif path == "/api/source/limits":
+                    self._send_json(self._resolver.set_limits(body))
+                else:
+                    self._send_json(self._sources.update(item.group(1), body))
+        except (ResolveError, SourceError, DownloadError) as error:
+            self._send_json({"error": error.code}, error.status)
+
+    def _relay(self, ticket):
+        """The audio behind a ticket, Range and all, straight through: nothing is kept on disk."""
+        try:
+            stream = self._resolver.open_stream(ticket, self.headers.get("Range"))
+        except ResolveError as error:
+            self._send_json({"error": error.code}, error.status)
+            return
+        try:
+            # A phone that stops reading for a minute lets its slot go.
+            self.connection.settimeout(60)
+            self.send_response(stream.status)
+            for name, value in stream.headers.items():
+                self.send_header(name, value)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            for chunk in stream.chunks():
+                self.wfile.write(chunk)
+        except OSError:
+            pass
+        finally:
+            stream.close()
+
     def do_GET(self):
         path = unquote(urlsplit(self.path).path)
         if path not in ("/", "/index.html") and not self._authorized():
@@ -153,6 +251,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
+        elif url.path == "/api/sources" or url.path.startswith("/api/source/"):
+            self._get_source(url.path)
         elif url.path.startswith("/api/"):
             if not self._panel_available():
                 self._send_json({"error": "not_found"}, 404)
@@ -224,6 +324,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     status["network"], status["hostIP"], "已设" if status["tokenSet"] else "未设",
                 )
                 self._send_json({**status, "home": self._is_trusted()})
+            elif path == "/api/sources" or path.startswith(("/api/sources/", "/api/source/")):
+                self._post_source(path)
             elif path == "/api/scan" and self._panel_available():
                 self._state.request_scan()
                 self._send_json({"ok": True})
@@ -322,17 +424,39 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         else:
             self.send_error(501, "Unsupported method ('POST')")
 
+    def do_DELETE(self):
+        path = unquote(urlsplit(self.path).path)
+        if path not in ("/", "/index.html") and not self._authorized():
+            self._send_json({"error": "unauthorized"}, 401)
+            return
+        path = urlsplit(self.path).path
+        if not path.startswith("/api/"):
+            self.send_error(501, "Unsupported method ('DELETE')")
+            return
+        item = _SOURCE_ITEM.fullmatch(path)
+        if item is None or item.group(2):
+            self._send_json({"error": "not_found"}, 404)
+        elif self._sources is None or self._resolver is None:
+            self._send_json({"error": "source_unconfigured"}, 503)
+        elif self._home_only():
+            try:
+                self._sources.delete(item.group(1))
+            except SourceError as error:
+                self._send_json({"error": error.code}, error.status)
+                return
+            self._send_json({"ok": True})
+
 
 def make_server(
     out, port, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-    access=None,
+    access=None, sources=None, resolver=None,
 ):
     if access is None:
         access = AccessSettings(None, network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2")
     handler = functools.partial(
         _Handler, directory=str(out), data=data, state=state, index=index, asker=asker, butler=butler, llm=llm,
         downloads=downloads,
-        access=access,
+        access=access, sources=sources, resolver=resolver,
     )
     return http.server.ThreadingHTTPServer(("", port), handler)
 
