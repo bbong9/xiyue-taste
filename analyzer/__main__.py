@@ -20,12 +20,17 @@ from .sources import SourceStore
 
 
 def _run_sources(runner, sources):
-    """Starts the source runner; every 10 minutes, enabled sources whose load failed get another try."""
+    """Starts the runner; every 10 minutes retries loads and checks one due origin link."""
     if not runner.start():
         return
     while True:
         time.sleep(600)
-        sources.retry_failed()
+        # One failed cycle (a full disk, say) must not end retries and checks for good.
+        for step in (sources.retry_failed, sources.auto_check):
+            try:
+                step()
+            except Exception:
+                LOGGER.exception("SOURCE-CYCLE %s failed", step.__name__)
 
 
 def main():
@@ -92,6 +97,7 @@ def main():
         sources = SourceStore(args.data, runner)
         resolver = Resolver(sources, runner, args.data)
         runner.on_ready = sources.reload_all
+        runner.on_alert = sources.note_alert
         threading.Thread(target=_run_sources, args=(runner, sources), name="sources", daemon=True).start()
         server = make_server(
             args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler, llm=llm,

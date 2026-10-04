@@ -19,7 +19,7 @@
 //   {"type":"request","id","requestKey","url","options"}
 //   {"type":"cancel","id","requestKey"}
 //   {"type":"result","callId","ok":true,"url"} / {"type":"result","callId","ok":false,"error"}
-//   {"type":"alert","id"}
+//   {"type":"alert","id","log","updateUrl":string|null}
 
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -47,6 +47,21 @@ const diagnose = text => {
 }
 
 const utf8Length = value => Buffer.byteLength(value, 'utf8')
+
+const validUpdateURL = value => {
+  // iOS checks the raw alert URL's bytes, then trims it.
+  if (typeof value !== 'string' || utf8Length(value) > 2048) return null
+  const text = value.trim()
+  try {
+    const url = new URL(text)
+    const authority = text.match(/^https:\/\/([^/?#]*)/i)?.[1]
+    if (url.protocol !== 'https:' || !url.hostname || authority == null ||
+        authority.includes('@') || text.includes('#')) return null
+    return text
+  } catch {
+    return null
+  }
+}
 
 // iOS measures with sortedKeys; key order does not change the length.
 const jsonLength = value => {
@@ -289,13 +304,17 @@ class Runtime {
 
   handleUpdateAlert(data) {
     if (data == null || utf8Length(data) > MAX_ALERT_BYTES) return
+    let message
     try {
       const object = JSON.parse(data)
-      if (typeof object?.log !== 'string' || !object.log.trim()) return
+      if (object == null || Array.isArray(object) || typeof object.log !== 'string') return
+      const log = Array.from(object.log.trim()).slice(0, 1024).join('')
+      if (!log) return
+      message = { type: 'alert', id: this.id, log, updateUrl: validUpdateURL(object.updateUrl) }
     } catch {
       return
     }
-    send({ type: 'alert', id: this.id })
+    if (jsonLength(message) <= MAX_LINE_BYTES) send(message)
   }
 
   setTimer(id, timeout) {

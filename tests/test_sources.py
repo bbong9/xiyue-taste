@@ -19,17 +19,20 @@ import re
 import shutil
 import signal
 import stat
+import subprocess
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
-from analyzer import serve
+from analyzer import lxnet, serve, sources
 from analyzer.access import AccessSettings
-from analyzer.downloads import DownloadError
+from analyzer.downloads import DownloadError, Downloads
 from analyzer.log import LOGGER
 from analyzer.lxhost import Runner, RunnerError
+from analyzer.panel import OutputIndex, PanelState
 from analyzer.resolver import (
     CACHE_SECONDS, COOLDOWN_SECONDS, MAX_STREAMS, OWNER, REPORTED_SECONDS, SHANGHAI, TICKET_SECONDS,
     ResolveError, Resolver, SourceLedger, Transports,
@@ -277,9 +280,10 @@ def _today(resolver):
 
 
 @contextlib.contextmanager
-def _container(tmp_path, store, resolver, access=None, downloads=None):
+def _container(tmp_path, store, resolver, access=None, downloads=None, panel=False):
     server = make_server(
         tmp_path, 0, data=tmp_path, downloads=downloads, access=access, sources=store, resolver=resolver,
+        state=PanelState() if panel else None, index=OutputIndex(tmp_path) if panel else None,
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -1046,7 +1050,7 @@ def test_source_download_hands_the_address_to_the_queue_and_never_to_the_phone(t
     with _container(tmp_path, store, resolver, downloads=downloads) as port:
         status, _, data = _call(port, "POST", "/api/source/download", {**_song("kw", "1"), **fields, "userAgent": "phone"})
     assert (status, json.loads(data)) == (200, {"id": "job-1", "quality": "320k", "sourceName": "A"})
-    assert downloads.jobs == [{"url": "http://127.0.0.1:9/kw/1/320k.mp3", **fields}]
+    assert downloads.jobs == [{"url": "http://127.0.0.1:9/kw/1/320k.mp3", **fields, "sourceName": "A"}]
 
     # A job the queue refuses gives the account its download back.
     with pytest.raises(DownloadError):
@@ -1080,3 +1084,556 @@ def test_source_resolve_checks_the_song_shape_only(tmp_path, change, code):
     song = _song("kg", "2")
     del song["musicInfo"]["hash"]
     assert resolver.resolve(song, OWNER)["transport"] == "relay"
+
+
+# Card 54: source links never leave the store, and only injected fetches retrieve them.
+ORIGIN = "https://origin.invalid/private/source.js?key=test-origin-secret"
+UPDATE = "https://updates.invalid/private/latest.js?key=test-update-secret"
+
+
+def _source_script(version="1.0.0", name="A"):
+    return f"/*\n * @name {name}\n * @version {version}\n * @author 作者\n * @description 说明\n */\n"
+
+
+class _Fetch:
+    def __init__(self, script=None):
+        self.reply = lxnet.Reply("", "{}", script if script is not None else _source_script(), "origin.invalid", 200)
+        self.calls = []
+
+    def __call__(self, url, options, *, allow_private=False):
+        self.calls.append((url, options, allow_private))
+        return self.reply
+
+    def script(self, text):
+        self.reply = self.reply._replace(error="", status=200, body_text=text)
+
+
+def _linked(tmp_path, monkeypatch, *, allow_private=False):
+    clock, runner, fetch = _Clock(), _StubRunner(), _Fetch()
+    monkeypatch.setattr(sources.time, "time", clock)
+    runner.declared["A"] = {"kw": TIERS}
+    store = SourceStore(tmp_path, runner, allow_private=allow_private, fetch=fetch)
+    return store, runner, fetch, clock
+
+
+def _saved(tmp_path, source_id):
+    entries = json.loads((tmp_path / "sources" / "index.json").read_text(encoding="utf-8"))
+    return next(entry for entry in entries if entry["id"] == source_id)
+
+
+def test_source_link_import_keeps_links_private_in_http_and_logs(tmp_path, monkeypatch, logged):
+    monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
+    store, runner, fetch, clock = _linked(tmp_path, monkeypatch)
+    resolver = Resolver(store, runner, tmp_path, clock=clock)
+    with _container(tmp_path, store, resolver) as port:
+        status, _, data = _call(port, "POST", "/api/sources/import", {"url": " \n" + ORIGIN + " \n"})
+        row = json.loads(data)
+        assert status == 200 and row["originHost"] == "origin.invalid"
+        status, _, listed = _call(port, "GET", "/api/sources")
+        assert status == 200 and json.loads(listed)["sources"][0]["originHost"] == "origin.invalid"
+    assert fetch.calls == [(ORIGIN, {"method": "GET", "timeout": 15000}, False)]
+    assert _saved(tmp_path, row["id"])["originURL"] == ORIGIN
+    for text in (data.decode(), listed.decode(), "\n".join(logged)):
+        assert "originURL" not in text and "updateURL" not in text
+        assert ORIGIN not in text and "test-origin-secret" not in text and "/private/" not in text
+    assert {stat.S_IMODE(path.stat().st_mode) for path in (tmp_path / "sources").iterdir()} == {0o600}
+    restored = SourceStore(tmp_path, runner, fetch=fetch)
+    assert restored.get(row["id"])["originHost"] == "origin.invalid"
+
+
+@pytest.mark.parametrize("url", [
+    "http://example.invalid/a.js", "https://user:pass@example.invalid/a.js",
+    "https://@example.invalid/a.js", "https://example.invalid/a.js#",
+    "https://example.invalid/a.js#v2", "https://example.invalid/" + "a" * 2048,
+    "https://example.invalid/" + "中" * 700, "https://", None, 5,
+])
+def test_source_link_import_rejects_invalid_urls_before_fetch(tmp_path, monkeypatch, url):
+    store, _, fetch, _ = _linked(tmp_path, monkeypatch)
+    with pytest.raises(SourceError) as caught:
+        store.import_url(url)
+    assert (caught.value.code, caught.value.status) == ("invalid_url", 400)
+    assert fetch.calls == [] and store.list() == []
+
+
+@pytest.mark.parametrize(("error", "status", "text", "reason"), [
+    ("timeout", None, "", "timeout"),
+    ("request_rejected", None, "", "request_rejected"),
+    ("", 403, "not a script", "http_403"),
+    ("", 204, "", "empty_response"),
+    ("", 200, "\ud800", "empty_response"),
+])
+def test_source_fetch_failures_log_only_host_and_reason(tmp_path, monkeypatch, logged, error, status, text, reason):
+    store, _, fetch, _ = _linked(tmp_path, monkeypatch)
+    fetch.reply = lxnet.Reply(error, "{}", text, "origin.invalid", status)
+    with pytest.raises(SourceError) as caught:
+        store.import_url(ORIGIN)
+    assert (caught.value.code, caught.value.status) == ("fetch_failed", 502)
+    assert any(f"host=origin.invalid error={reason}" in line for line in logged)
+    assert ORIGIN not in "\n".join(logged) and "test-origin-secret" not in "\n".join(logged)
+    assert store.list() == []
+
+
+@pytest.mark.parametrize(("text", "code"), [
+    ("not a source", "invalid_script"),
+    (_source_script() + "x" * 1_048_576, "script_too_large"),
+])
+def test_source_link_uses_the_script_inspector(tmp_path, monkeypatch, text, code):
+    store, _, fetch, _ = _linked(tmp_path, monkeypatch)
+    fetch.script(text)
+    with pytest.raises(SourceError) as caught:
+        store.import_url(ORIGIN)
+    assert caught.value.code == code and store.list() == []
+
+
+def test_source_link_duplicate_reuses_id_and_records_the_new_origin(tmp_path, monkeypatch):
+    store, runner, fetch, _ = _linked(tmp_path, monkeypatch, allow_private=True)
+    original = store.add(_source_script())
+    store.update(original["id"], {"enabled": False, "alias": "我的源", "dailyQuota": 77})
+    imported = store.import_url(ORIGIN)
+    assert imported["existing"] is True and imported["id"] == original["id"]
+    assert imported["enabled"] is True and original["id"] in runner.loaded()
+    assert imported["alias"] == "我的源" and imported["dailyQuota"] == 77
+    assert imported["originHost"] == "origin.invalid" and len(store.list()) == 1
+    assert _saved(tmp_path, original["id"])["originURL"] == ORIGIN
+    assert fetch.calls[-1][2] is True
+    with pytest.raises(SourceError, match="duplicate"):
+        store.add(_source_script())
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_source_replace_keeps_identity_settings_and_usage(tmp_path, monkeypatch, enabled):
+    store, runner, _, clock = _linked(tmp_path, monkeypatch)
+    before = store.add(_source_script())
+    source_id = before["id"]
+    store.update(source_id, {"alias": "  我的源  ", "dailyQuota": 77, "enabled": enabled})
+    ledger = SourceLedger(tmp_path, clock)
+    ledger.take_source(source_id, 77, enforce=True)
+    usage = (tmp_path / "source-usage.json").read_bytes()
+    clock.advance(10)
+    runner.declared["新版名"] = {"kw": ["320k"], "tx": ["flac"]}
+    store._suspects[source_id] = 2
+    store._quarantined.add(source_id)
+    replacement = _source_script("2.0.0", "新版名").replace("@description 说明", "@description 新说明\n * @homepage https://example.invalid")
+    answer = store.replace(source_id, replacement)
+    after = answer["source"]
+    assert answer["changed"] is True
+    assert (after["id"], after["version"], after["name"], after["alias"]) == (source_id, "2.0.0", "新版名", "我的源")
+    assert after["platforms"] == {"kw": ["320k"], "tx": ["flac"]}
+    assert (after["enabled"], after["dailyQuota"], after["order"], after["addedAt"]) == (
+        enabled, 77, before["order"], before["addedAt"],
+    )
+    assert after["previousVersion"] == "1.0.0" and after["updatedAt"] == int(clock())
+    assert after["description"] == "新说明" and after["homepage"] == "https://example.invalid"
+    assert after["sha256"] == hashlib.sha256(replacement.encode()).hexdigest()
+    assert after["hasPrevious"] is True and (source_id in runner.loaded()) is enabled
+    assert source_id not in store._suspects and source_id not in store._quarantined
+    assert (tmp_path / "source-usage.json").read_bytes() == usage
+    path, previous = tmp_path / "sources" / f"{source_id}.js", tmp_path / "sources" / f"{source_id}.prev.js"
+    assert previous.read_text() == _source_script() and path.read_text() == replacement
+    assert stat.S_IMODE(previous.stat().st_mode) == stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_source_replace_same_or_duplicate_never_swaps_files(tmp_path, monkeypatch, logged):
+    store, runner, _, clock = _linked(tmp_path, monkeypatch)
+    source_id = store.add(_source_script())["id"]
+    path = tmp_path / "sources" / f"{source_id}.js"
+    mtime = path.stat().st_mtime_ns
+    clock.advance(20)
+    assert store.replace(source_id, _source_script(), origin="link")["changed"] is False
+    assert store.get(source_id)["lastCheckedAt"] == int(clock())
+    assert path.stat().st_mtime_ns == mtime
+    assert not (tmp_path / "sources" / f"{source_id}.prev.js").exists()
+    runner.declared["B"] = {"kw": TIERS}
+    store.add(_source_script(name="B"))
+    with pytest.raises(SourceError) as caught:
+        store.replace(source_id, _source_script(name="B"))
+    assert (caught.value.code, caught.value.status) == ("duplicate", 409)
+    assert path.read_text() == _source_script()
+    assert any("SOURCE-REPLACE" in line and "error=duplicate" in line for line in logged)
+
+
+@needs_node
+def test_source_failed_replacement_restores_callable_old_script(tmp_path, node_runner, upstream, logged):
+    runner = node_runner()
+    store = SourceStore(tmp_path, runner)
+    script = _script(upstream.base, "old")
+    source_id = store.add(script)["id"]
+    bad = script.replace("@version 1.0.0", "@version 2.0.0") + "\nthrow new Error('secret-failure-message')"
+    with pytest.raises(SourceError) as caught:
+        store.replace(source_id, bad)
+    assert (caught.value.code, caught.value.status) == ("update_failed", 409)
+    assert store.get(source_id)["enabled"] is True and store.get(source_id)["loadError"] == "script_failed"
+    assert runner.call(source_id, "kw", "320k", {"songmid": "1"}) == upstream.url("/media/old-kw-320k.mp3")
+    assert (tmp_path / "sources" / f"{source_id}.js").read_text() == script
+    assert store.get(source_id)["hasPrevious"] is False
+    assert "secret-failure-message" not in "\n".join(logged)
+
+
+def test_source_rollback_swaps_two_versions_and_delete_removes_both(tmp_path, monkeypatch):
+    store, _, _, _ = _linked(tmp_path, monkeypatch)
+    original = _source_script().replace("\n", "\r\n")
+    source_id = store.add(original)["id"]
+    with pytest.raises(SourceError) as caught:
+        store.rollback(source_id)
+    assert (caught.value.code, caught.value.status) == ("no_previous", 409)
+    store.replace(source_id, _source_script("2.0.0"))
+    assert store.rollback(source_id)["source"]["version"] == "1.0.0"
+    assert (tmp_path / "sources" / f"{source_id}.js").read_bytes() == original.encode()
+    assert store.rollback(source_id)["source"]["version"] == "2.0.0"
+    assert _saved(tmp_path, source_id)["previousVersion"] == "1.0.0"
+    store.delete(source_id)
+    assert not (tmp_path / "sources" / f"{source_id}.js").exists()
+    assert not (tmp_path / "sources" / f"{source_id}.prev.js").exists()
+
+
+def test_source_links_repeated_in_metadata_or_alert_stay_private(tmp_path, monkeypatch, logged):
+    store, _, fetch, _ = _linked(tmp_path, monkeypatch)
+    url = "https://s.invalid/?key=test"
+    fetch.script(_source_script(version=url))
+    source_id = store.import_url(url)["id"]
+    store.note_alert(source_id, "更新在 " + UPDATE, UPDATE)
+    row = store.get(source_id)
+    assert row["updateMessage"] == "更新在 updates.invalid"
+    assert url not in json.dumps(row) and UPDATE not in json.dumps(row)
+    store.replace(source_id, _source_script("2.0.0"))
+    assert url not in "\n".join(logged) and UPDATE not in "\n".join(logged)
+    assert url not in json.dumps(store.list())
+
+
+@needs_node
+def test_source_runner_alert_is_saved_privately_and_manual_refresh_follows_it(tmp_path, node_runner, monkeypatch, logged):
+    runner, fetch = node_runner(), _Fetch()
+    store = SourceStore(tmp_path, runner, fetch=fetch)
+    runner.on_alert = store.note_alert
+    script = _script("http://127.0.0.1:9", "alert")
+    alert_script = script + "\nlx.send(lx.EVENT_NAMES.updateAlert, " + json.dumps({
+        "log": "  有新功能  ", "updateUrl": UPDATE,
+    }) + ")"
+    fetch.script(alert_script)
+    source_id = store.import_url(ORIGIN)["id"]
+    assert _settle(lambda: store.get(source_id)["updateMessage"] == "有新功能")
+    row = store.get(source_id)
+    assert row["hasUpdateURL"] is True and row["updateAlertAt"] > 0
+    assert "updateURL" not in row and UPDATE not in json.dumps(row)
+    assert _saved(tmp_path, source_id)["updateURL"] == UPDATE
+    assert [call[0] for call in fetch.calls] == [ORIGIN]
+    path = tmp_path / "sources" / "index.json"
+    content, mtime, count = path.read_bytes(), path.stat().st_mtime_ns, len(logged)
+    store.note_alert(source_id, "有新功能", UPDATE)
+    assert (path.read_bytes(), path.stat().st_mtime_ns, len(logged)) == (content, mtime, count)
+    fetch.script(script.replace("@version 1.0.0", "@version 2.0.0"))
+    answer = store.refresh(source_id)
+    assert answer["changed"] is True
+    saved = _saved(tmp_path, source_id)
+    assert saved["originURL"] == UPDATE and saved["updateURL"] == "" and saved["updateMessage"] == ""
+    assert [call[0] for call in fetch.calls] == [ORIGIN, UPDATE]
+    assert all(url not in "\n".join(logged) for url in (ORIGIN, UPDATE))
+
+
+@needs_node
+def test_source_runner_alert_validates_message_size_and_update_urls(node_runner):
+    runner = node_runner(start=False)
+    received = []
+    runner.on_alert = lambda *alert: received.append(alert)
+    alerts = [{"log": message, "updateUrl": url} for message, url in (
+        (" \n ", UPDATE), ("x" * 8200, UPDATE), ("不合格链接", "http://bad.invalid/file.js"),
+        ("🎵" * 1030, UPDATE), ("超长链接", " " * 2048 + UPDATE),
+    )]
+    # preload captures its native call and truncates log first. Exercise the actual native
+    # handler separately, then feed its protocol messages through Python's boundary.
+    source = (Path(serve.__file__).parent / "lxrunner" / "runner.mjs").read_text()
+    constants = source[source.index("const MAX_INIT_INFO_BYTES"):source.index("const runtimes =")]
+    helpers = source[source.index("const utf8Length ="):source.index("// atob's")]
+    handler = source[source.index("  handleUpdateAlert(data) {"):source.index("  setTimer(")]
+    source_id = "a" * 16
+    javascript = constants + helpers + f"""
+const messages = []
+const send = message => messages.push(message)
+class AlertRuntime {{
+  constructor() {{ this.id = '{source_id}' }}
+  {handler}
+}}
+const runtime = new AlertRuntime()
+for (const payload of JSON.parse(require('node:fs').readFileSync(0, 'utf8'))) {{
+  runtime.handleUpdateAlert(JSON.stringify(payload))
+}}
+process.stdout.write(JSON.stringify(messages))
+"""
+    result = subprocess.run([NODE, "-e", javascript], input=json.dumps(alerts), text=True, capture_output=True, check=True)
+    messages = json.loads(result.stdout)
+    assert len(messages) == 3
+    for message in messages:
+        runner._dispatch(None, message)
+    assert _settle(lambda: len(received) == 3)
+    assert set(received) == {
+        (source_id, "不合格链接", None), (source_id, "🎵" * 1024, UPDATE), (source_id, "超长链接", None),
+    }
+
+
+@pytest.mark.parametrize("url", [
+    "http://example.invalid/a", "https://user@example.invalid/a", "https://example.invalid/a#",
+    " " * 2048 + "https://example.invalid/a", None, 12,
+])
+def test_source_alert_invalid_url_is_not_saved(tmp_path, monkeypatch, url):
+    store, _, _, _ = _linked(tmp_path, monkeypatch)
+    source_id = store.add(_source_script())["id"]
+    store.note_alert(source_id, " " + "新" * 1100 + " ", url)
+    assert store.get(source_id)["updateMessage"] == "新" * 1024
+    assert store.get(source_id)["hasUpdateURL"] is False
+    assert _saved(tmp_path, source_id)["updateURL"] == ""
+
+
+def test_source_python_alert_boundary_rejects_bad_protocol_messages(tmp_path, node_runner):
+    # Exercise Python directly so a correct Node implementation cannot hide a bad Python boundary.
+    runner = node_runner(start=False)
+    received = []
+    runner.on_alert = lambda *alert: received.append(alert)
+    source_id = "a" * 16
+    for body in ({"log": []}, {"log": " \n "}, {"log": "x" * 8193}, {"log": "\ud800"}):
+        runner._dispatch(None, {"type": "alert", "id": source_id, **body})
+    runner._dispatch(None, {"type": "alert", "id": "bad/id", "log": "x"})
+    runner._dispatch(None, {"type": "alert", "id": source_id, "log": "  更新  ", "updateUrl": "http://x.invalid"})
+    assert _settle(lambda: len(received) == 1)
+    assert received == [(source_id, "更新", None)]
+
+
+def test_source_refresh_same_adopts_alert_url_and_without_url_fails(tmp_path, monkeypatch):
+    store, _, fetch, clock = _linked(tmp_path, monkeypatch)
+    source_id = store.add(_source_script())["id"]
+    with pytest.raises(SourceError) as caught:
+        store.refresh(source_id)
+    assert (caught.value.code, caught.value.status) == ("no_update_url", 409)
+    store.note_alert(source_id, "更新", UPDATE)
+    answer = store.refresh(source_id)
+    assert answer["changed"] is False and answer["source"]["originHost"] == "updates.invalid"
+    saved = _saved(tmp_path, source_id)
+    assert saved["originURL"] == UPDATE and saved["updateURL"] == ""
+    assert saved["lastCheckResult"] == "same" and saved["lastCheckedAt"] == int(clock())
+    assert len(fetch.calls) == 1
+
+
+def test_source_auto_check_runs_once_daily_on_origin_even_when_disabled(tmp_path, monkeypatch, logged):
+    store, runner, fetch, clock = _linked(tmp_path, monkeypatch)
+    source_id = store.import_url(ORIGIN)["id"]
+    store.update(source_id, {"enabled": False})
+    store.note_alert(source_id, "手动更新提示", UPDATE)
+    store.auto_check()
+    assert len(fetch.calls) == 1
+    clock.advance(86400)
+    script_path = tmp_path / "sources" / f"{source_id}.js"
+    mtime = script_path.stat().st_mtime_ns
+    store.auto_check()
+    row = store.get(source_id)
+    assert (row["lastCheckResult"], row["lastCheckedAt"], row["updateMessage"]) == ("same", int(clock()), "手动更新提示")
+    assert script_path.stat().st_mtime_ns == mtime and row["hasPrevious"] is False
+    store.auto_check()
+    assert len(fetch.calls) == 2
+    fetch.script(_source_script("2.0.0"))
+    clock.advance(86400)
+    store.auto_check()
+    row = store.get(source_id)
+    assert (row["version"], row["lastCheckResult"], row["enabled"]) == ("2.0.0", "updated", False)
+    assert source_id not in runner.loaded() and row["updateMessage"] == ""
+    assert [call[0] for call in fetch.calls] == [ORIGIN] * 3
+    assert any("SOURCE-AUTO-CHECK" in line and "result=updated" in line for line in logged)
+
+
+def test_source_auto_check_processes_one_due_source_and_records_failures(tmp_path, monkeypatch):
+    store, runner, fetch, clock = _linked(tmp_path, monkeypatch)
+    first = store.import_url(ORIGIN)["id"]
+    runner.declared["B"] = {"kw": TIERS}
+    fetch.script(_source_script(name="B"))
+    second = store.import_url("https://second.invalid/source.js")["id"]
+    clock.advance(86400)
+    fetch.reply = fetch.reply._replace(error="timeout", status=None, body_text="")
+    store.auto_check()
+    assert store.get(first)["lastCheckResult"] == "fetch_failed"
+    assert store.get(first)["lastCheckedAt"] == int(clock())
+    assert store.get(second)["lastCheckedAt"] == int(clock()) - 86400
+    assert len(fetch.calls) == 3
+    store.auto_check()
+    assert store.get(second)["lastCheckResult"] == "fetch_failed" and len(fetch.calls) == 4
+    store.auto_check()
+    assert len(fetch.calls) == 4
+    assert store.get(first)["version"] == "1.0.0"
+
+
+def test_source_auto_update_load_failure_keeps_old_script_enabled(tmp_path, monkeypatch):
+    store, runner, fetch, clock = _linked(tmp_path, monkeypatch)
+    source_id = store.import_url(ORIGIN)["id"]
+    original_load = runner.load
+
+    def load(source_id, script, meta):
+        if meta["version"] == "2.0.0":
+            runner.unload(source_id)
+            raise RunnerError("script_failed")
+        return original_load(source_id, script, meta)
+
+    monkeypatch.setattr(runner, "load", load)
+    fetch.script(_source_script("2.0.0"))
+    clock.advance(86400)
+    store.auto_check()
+    row = store.get(source_id)
+    assert (row["enabled"], row["version"], row["loadError"], row["lastCheckResult"]) == (
+        True, "1.0.0", "script_failed", "update_failed",
+    )
+    assert source_id in runner.loaded()
+    assert (tmp_path / "sources" / f"{source_id}.js").read_text() == _source_script()
+    store.auto_check()
+    assert len(fetch.calls) == 2
+
+
+def test_source_background_loop_waits_before_checking(monkeypatch):
+    from analyzer import __main__ as main
+
+    events = []
+
+    class Stop(Exception):
+        pass
+
+    class RunnerStub:
+        def start(self):
+            events.append("start")
+            return True
+
+    class StoreStub:
+        def retry_failed(self):
+            events.append("retry")
+
+        def auto_check(self):
+            events.append("auto")
+            raise OSError("disk full")
+
+    def sleep(seconds):
+        events.append(seconds)
+        if events.count(600) > 1:
+            raise Stop
+
+    monkeypatch.setattr(main.time, "sleep", sleep)
+    with pytest.raises(Stop):
+        main._run_sources(RunnerStub(), StoreStub())
+    # A failed check is logged; the next cycle still comes.
+    assert events == ["start", 600, "retry", "auto", 600]
+
+
+def test_source_alias_reaches_panel_usage_resolve_download_and_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
+    # Keep the real queue's jobs queued: this test exercises metadata, not fetching an audio file.
+    monkeypatch.setattr(Downloads, "_work", lambda self: None)
+    runner, store, resolver = _stubbed(tmp_path)
+    source_id = _add(store, runner, "A", platforms=("kw",))
+    downloads = Downloads(tmp_path, allow_private=True)
+    with _container(tmp_path, store, resolver, downloads=downloads, panel=True) as port:
+        status, _, data = _call(port, "POST", f"/api/sources/{source_id}", {"alias": "  聆澜音源  "})
+        assert status == 200 and json.loads(data)["alias"] == "聆澜音源"
+        status, _, data = _call(port, "GET", "/api/sources")
+        assert status == 200 and json.loads(data)["sources"][0]["displayName"] == "聆澜音源"
+        for number in range(2):  # Cached answers use the current alias too.
+            status, _, data = _call(port, "POST", "/api/source/resolve", _song("kw", "1"))
+            assert status == 200 and json.loads(data)["sourceName"] == "聆澜音源"
+        body = {**_song("kw", "2"), "filename": "song.mp3", "sourceName": "手机传来的假名字"}
+        status, _, data = _call(port, "POST", "/api/source/download", body)
+        assert status == 200 and json.loads(data)["sourceName"] == "聆澜音源"
+        status, _, data = _call(port, "GET", "/api/downloads")
+        assert status == 200 and json.loads(data)["jobs"][0]["sourceName"] == "聆澜音源"
+        status, _, data = _call(port, "GET", "/api/source/usage")
+        assert status == 200 and json.loads(data)["days"][0]["sources"][0]["name"] == "聆澜音源"
+        status, _, data = _call(port, "POST", "/api/downloads", {
+            "url": "https://audio.invalid/song.mp3", "filename": "song.mp3", "sourceName": "  上传者  ",
+        })
+        assert status == 200
+        assert downloads.snapshot()[0]["sourceName"] == "上传者"
+    for alias in ("x" * 33, None, 5):
+        with pytest.raises(SourceError):
+            store.update(source_id, {"alias": alias})
+    store.update(source_id, {"alias": " "})
+    assert resolver.resolve(_song("kw", "1"), OWNER)["sourceName"] == "A"
+    assert SourceStore(tmp_path, runner).get(source_id)["alias"] == ""
+
+
+@pytest.mark.parametrize("name", [None, 1, "a" * 65])
+def test_download_source_name_validation(tmp_path, monkeypatch, name):
+    monkeypatch.setattr(Downloads, "_work", lambda self: None)
+    downloads = Downloads(tmp_path)
+    with pytest.raises(DownloadError, match="bad_request"):
+        downloads.submit({"url": "https://audio.invalid/song.mp3", "filename": "song.mp3", "sourceName": name})
+    downloads.submit({"url": "https://audio.invalid/song.mp3", "filename": "song.mp3"})
+    assert downloads.snapshot()[0]["sourceName"] == ""
+
+
+def test_source_new_http_routes_limits_and_home_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
+    store, runner, fetch, clock = _linked(tmp_path, monkeypatch)
+    resolver = Resolver(store, runner, tmp_path, clock=clock)
+    access = AccessSettings(None, token=TOKEN, network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2")
+    with _container(tmp_path, store, resolver, access=access) as port:
+        status, _, data = _call(port, "POST", "/api/sources/import", {"url": ORIGIN, "padding": "x" * 4096})
+        assert status == 413 and fetch.calls == []
+        source_id = store.add(_source_script())["id"]
+        status, _, data = _call(
+            port, "POST", f"/api/sources/{source_id}/replace", {"script": _source_script("2.0.0") + "//" + "x" * 5000},
+        )
+        assert status == 200 and json.loads(data)["changed"] is True
+        status, _, data = _call(port, "POST", f"/api/sources/{source_id}/rollback")
+        assert status == 200 and json.loads(data)["source"]["version"] == "1.0.0"
+        status, _, data = _call(port, "POST", f"/api/sources/{source_id}/refresh")
+        assert status == 409 and json.loads(data)["error"] == "no_update_url"
+        status, _, data = _call(
+            port, "POST", f"/api/sources/{source_id}/replace", {}, {"Content-Length": str(6 * 1024 * 1024 + 1)},
+        )
+        assert status == 413
+        store.import_url(ORIGIN)
+        status, _, data = _call(port, "POST", f"/api/sources/{source_id}/refresh")
+        assert status == 200 and json.loads(data)["changed"] is False
+        monkeypatch.setattr(_Handler, "_is_trusted", lambda self: False)
+        for suffix, body in [
+            ("import", {"url": ORIGIN}), (f"{source_id}/replace", {"script": _source_script("3.0.0")}),
+            (f"{source_id}/refresh", None), (f"{source_id}/rollback", None),
+        ]:
+            status, _, data = _call(port, "POST", "/api/sources/" + suffix, body, {"Authorization": "Bearer " + TOKEN})
+            assert status == 403 and json.loads(data) == {"error": "home_only"}
+
+
+@needs_node
+def test_source_panel_renders_alias_and_update_message_as_plain_text():
+    panel = (Path(serve.__file__).parent / "static" / "index.html").read_text()
+    functions = panel[panel.index("    const sourceErrors ="):panel.index("    let lastSources =")]
+    row = {
+        "id": "a" * 16, "name": "原名", "displayName": "聆澜音源", "alias": "聆澜音源",
+        "version": "2.0.0", "author": "作者", "originHost": "origin.invalid",
+        "hasUpdateURL": True, "hasPrevious": True, "enabled": True, "loaded": True, "platforms": {"kw": ["320k"]},
+        "dailyQuota": 1000, "used": 1, "updateMessage": "<img src=x onerror=alert(1)>",
+        "lastCheckedAt": 1_800_000_000, "lastCheckResult": "same",
+    }
+    javascript = r"""
+const vm = require('node:vm')
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const el = (tag, className, text) => ({
+  tag, className, textContent: text == null ? '' : String(text), children: [], dataset: {},
+  append(...nodes) { this.children.push(...nodes) },
+  setAttribute() {}, addEventListener() {},
+  set innerHTML(_) { throw new Error('script text reached innerHTML') },
+})
+const context = { el, platformNames: { kw: '酷我' }, row: input.row }
+const row = vm.runInNewContext(input.functions + '\nsourceRow(row, 0, 1, true)', context)
+process.stdout.write(JSON.stringify(row))
+"""
+    result = subprocess.run(
+        [NODE, "-e", javascript], input=json.dumps({"functions": functions, "row": row}),
+        text=True, capture_output=True, check=True,
+    )
+    tree = json.loads(result.stdout)
+    texts = []
+
+    def visit(node):
+        texts.append(node["textContent"])
+        assert node["tag"] != "img"
+        for child in node["children"]:
+            visit(child)
+
+    visit(tree)
+    assert texts[2] == "聆澜音源"
+    assert any("原名 · 2.0.0 · 作者 · 链接 origin.invalid" in text for text in texts)
+    assert "有新版本" in texts and row["updateMessage"] in texts
+    assert {"更新", "换文件", "退回上一版", "备注"}.issubset(texts)
+    assert any("检查过，已是最新" in text for text in texts)

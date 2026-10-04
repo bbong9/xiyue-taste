@@ -19,7 +19,7 @@ from .settings import SettingsError
 from .sources import SourceError
 
 
-_SOURCE_ITEM = re.compile(r"/api/sources/([0-9a-f]{16})(/test)?")
+_SOURCE_ITEM = re.compile(r"/api/sources/([0-9a-f]{16})(/test|/replace|/refresh|/rollback)?")
 _STREAM_PREFIX = "/api/source/stream/"
 _auth_rejections = {}
 _auth_rejections_lock = threading.Lock()
@@ -176,19 +176,28 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 body = self._read_json(4096)
                 if body is not None:
                     self._send_json(self._resolver.report_transport(body))
-            elif path not in ("/api/sources", "/api/source/limits") and item is None:
+            elif path not in ("/api/sources", "/api/sources/import", "/api/source/limits") and item is None:
                 self._send_json({"error": "not_found"}, 404)
             elif not self._home_only():
                 return
-            elif item is not None and item.group(2):
+            elif item is not None and item.group(2) == "/test":
                 self._send_json(self._resolver.test_source(item.group(1)))
+            elif item is not None and item.group(2) == "/refresh":
+                self._send_json(self._sources.refresh(item.group(1)))
+            elif item is not None and item.group(2) == "/rollback":
+                self._send_json(self._sources.rollback(item.group(1)))
             else:
                 # A script is at most 1 MiB, but JSON may spell a byte in six.
-                body = self._read_json(6 * 1024 * 1024 if path == "/api/sources" else 4096)
+                is_script = path == "/api/sources" or (item is not None and item.group(2) == "/replace")
+                body = self._read_json(6 * 1024 * 1024 if is_script else 4096)
                 if body is None:
                     return
                 if path == "/api/sources":
                     self._send_json(self._sources.add(body.get("script")))
+                elif path == "/api/sources/import":
+                    self._send_json(self._sources.import_url(body.get("url")))
+                elif item is not None and item.group(2) == "/replace":
+                    self._send_json(self._sources.replace(item.group(1), body.get("script")))
                 elif path == "/api/source/limits":
                     self._send_json(self._resolver.set_limits(body))
                 else:

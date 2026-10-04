@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -108,6 +109,40 @@ def _code(value, default):
     return value if isinstance(value, str) and _CODE.fullmatch(value) else default
 
 
+def source_url(value, *, trim_first=True):
+    """The iOS import URL rule; update alerts measure the raw value before trimming."""
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    try:
+        if len((url if trim_first else value).encode("utf-8")) > 2048:
+            return None
+        parts = urllib.parse.urlsplit(url)
+        if (
+            parts.scheme.lower() != "https" or not parts.hostname
+            or parts.username is not None or parts.password is not None or "#" in url
+        ):
+            return None
+    except (ValueError, UnicodeError):
+        return None
+    return url
+
+
+def update_alert(value):
+    """Validate again in Python, the runner protocol's trust boundary."""
+    if not isinstance(value, dict) or not isinstance(value.get("log"), str):
+        return None
+    try:
+        if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 8 * 1024:
+            return None
+    except (ValueError, UnicodeError):
+        return None
+    message = value["log"].strip()[:1024]
+    if not message:
+        return None
+    return message, source_url(value.get("updateUrl"), trim_first=False)
+
+
 def _platforms(value):
     """The loaded message's sources: known platforms, each with known tiers in tier order."""
     if not isinstance(value, dict) or not value:
@@ -136,6 +171,7 @@ class Runner:
         self._allow_private = allow_private
         self._load_timeout, self._call_timeout = load_timeout, call_timeout
         self.on_ready = None
+        self.on_alert = None
         self._lock = threading.Lock()
         self._wake = threading.Condition(self._lock)
         self._load_lock = threading.Lock()
@@ -449,10 +485,13 @@ class Runner:
                 abort.abort("cancelled")
         elif kind == "alert":
             source_id = message.get("id")
-            LOGGER.info(
-                "LXRUNNER alert source=%s",
-                source_id if isinstance(source_id, str) and _SOURCE_ID.fullmatch(source_id) else "?",
-            )
+            alert = update_alert(message)
+            if isinstance(source_id, str) and _SOURCE_ID.fullmatch(source_id) and alert is not None:
+                callback = self.on_alert
+                if callback is not None:
+                    # A load waits for this reader. Persist its alert after the store's
+                    # current operation, without holding up the loaded response.
+                    self._submit(callback, source_id, *alert)
 
     def _finish_load(self, process, message):
         source_id = message.get("id")

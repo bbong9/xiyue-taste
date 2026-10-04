@@ -520,7 +520,10 @@ class Resolver:
             raise ResolveError("download_unconfigured", 503)
         request = _request(body, purpose="download")
         found, receipt = self._logged(request, account, "nas")
-        job = {"url": found.url, **{name: body[name] for name in DOWNLOAD_FIELDS if name in body}}
+        job = {
+            "url": found.url, **{name: body[name] for name in DOWNLOAD_FIELDS if name in body},
+            "sourceName": found.source_name,
+        }
         try:
             job_id = downloads.submit(job)
         except DownloadError:
@@ -632,7 +635,7 @@ class Resolver:
     def usage(self):
         """GET /api/source/usage: today and the 6 days before, by source and by account."""
         entries = self._sources.list()
-        names = {entry["id"]: entry["name"] for entry in entries}
+        names = {entry["id"]: entry["displayName"] for entry in entries}
         days = [
             {
                 "date": book["date"],
@@ -783,7 +786,7 @@ class Resolver:
         entry = self._sources.get(cached.source_id)
         if entry is None or not entry["enabled"] or entry["dailyQuota"] <= 0:
             return None
-        return _Resolved(cached.url, tier, cached.source_id, entry["name"], cached.expires, True)
+        return _Resolved(cached.url, tier, cached.source_id, entry["displayName"], cached.expires, True)
 
     def _first_play(self, account, request, tier):
         """Marks a play; False when the account played this song at this tier in the last 10 minutes."""
@@ -841,7 +844,7 @@ class Resolver:
                     if code is None:
                         self._succeeded(source_id)
                         expires = self._store(request, tier, url, source_id)
-                        return _Resolved(url, tier, source_id, entry["name"], expires, False)
+                        return _Resolved(url, tier, source_id, entry["displayName"], expires, False)
                     blame = True
                 called = True
                 if blame:

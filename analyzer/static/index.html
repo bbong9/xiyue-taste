@@ -519,8 +519,16 @@
     <ul class="dl" id="sources-list"></ul>
     <div class="ai-actions">
       <button class="scan" id="sources-add" type="button">添加音源</button>
+      <button class="scan quiet" id="sources-import" type="button">从链接导入</button>
       <input id="sources-file" type="file" accept=".js,text/javascript,application/javascript" hidden>
+      <input id="sources-replace-file" type="file" accept=".js,text/javascript,application/javascript" hidden>
     </div>
+    <form id="sources-import-form" hidden>
+      <label class="field"><span>音源链接</span>
+        <input id="sources-url" type="password" placeholder="https://" autocomplete="off" required>
+      </label>
+      <div class="ai-actions"><button class="scan" id="sources-import-confirm" type="submit">确定</button></div>
+    </form>
     <p class="ai-result" id="sources-result" role="status" hidden></p>
     <p class="ai-note">脚本只存在这台 NAS 上，手机拿不到。每个音源每天的额度按调用次数算，几个音源轮着用。</p>
     <h3>家人限额</h3>
@@ -585,7 +593,12 @@
       if (token) headers.set("Authorization", "Bearer " + token);
       const response = await fetch(path, { ...options, headers });
       if (response.status === 401) $("access-token-form").hidden = false;
-      if (!response.ok) throw new Error(String(response.status));
+      if (!response.ok) {
+        const error = new Error(String(response.status));
+        const body = await response.json().catch(() => null);
+        error.code = body?.error;
+        throw error;
+      }
       return asBlob ? response.blob() : response.json();
     }
     function offline(on) { $("offline").hidden = !on || !$("access-token-form").hidden; }
@@ -868,7 +881,8 @@
       $("download-list").replaceChildren(...jobs.map(job => {
         const row = el("li", job.state === "done" ? "good" : job.state === "failed" ? "bad" : "");
         const name = el("div");
-        name.append(el("b", "", job.filename), el("small", "", job.path || job.directory || "下载目录"));
+        const detail = (job.path || job.directory || "下载目录") + (job.sourceName ? ` · ${job.sourceName}` : "");
+        name.append(el("b", "", job.filename), el("small", "", detail));
         let state = "排队中";
         if (job.state === "downloading") state = job.total ? `${Math.floor(job.received / job.total * 100)}% · ${megabytes(job.total)}` : megabytes(job.received);
         else if (job.state === "done") state = [job.format.toUpperCase(), job.bitDepth ? job.bitDepth + " bit" : "", megabytes(job.received)].filter(Boolean).join(" · ");
@@ -1236,11 +1250,27 @@
       cancelled: "被打断了", script_missing: "脚本文件不见了", not_loaded: "没加载上", timeout: "超时",
       invalid_result: "没给出地址", bad_address: "给的地址不能用", unplayable_format: "给的是加密或 ogg 格式",
       unsupported_quality: "没有 320k", unavailable: "没加载",
+      invalid_url: "链接要是 HTTPS，不能带用户名、密码或 #，且不超过 2048 字节",
+      fetch_failed: "没能拉取音源，请检查链接或稍后重试", update_failed: "新版加载失败，已保留旧版",
+      no_update_url: "这个音源没有更新链接", no_previous: "还没有上一版", duplicate: "同样的脚本已经在另一个音源里",
+      invalid_script: "不是能用的音源脚本：开头要有 @name 和 @version", script_too_large: "脚本太大，不能超过 1 MB",
+      save_failed: "保存失败", not_found: "音源已不存在", bad_request: "填写的内容不合要求",
     };
     let sourcesFocus = null;
     let sourcesRequest = 0;
     const sourceNotes = new Map();
     function sourceReason(code) { return sourceErrors[code] || code; }
+    function sourceFailure(error) {
+      return error.message === "403" ? "只能在家里的网络下修改" : sourceErrors[error.code] || "操作失败，请稍后重试";
+    }
+    function sourceCheck(source) {
+      if (!source.lastCheckedAt) return "";
+      const date = new Date(source.lastCheckedAt * 1000);
+      const day = date.toDateString() === new Date().toDateString() ? "今天" : date.toLocaleDateString("zh-CN");
+      const result = { same: "已是最新", updated: "已更新" }[source.lastCheckResult]
+        || sourceReason(source.lastCheckResult);
+      return `${day} ${clockTime(source.lastCheckedAt)} 检查过，${result}`;
+    }
     function clockTime(seconds) {
       return new Date(seconds * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
     }
@@ -1281,7 +1311,20 @@
         });
         sourcesResult("");
       } catch (error) {
-        sourcesResult(error.message === "403" ? "只能在家里的网络下修改" : error.message === "400" ? "额度要填 0 到 100000 的整数" : "没改成", "bad");
+        sourcesResult(sourceFailure(error), "bad");
+      }
+      await loadSources();
+    }
+    async function replaceSource(id, action, body) {
+      sourcesResult("正在检查并加载…");
+      try {
+        const result = await api(`/api/sources/${id}/${action}`, {
+          method: "POST",
+          ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+        });
+        sourcesResult(result.changed ? `已${action === "rollback" ? "退回" : "更新"} ${result.source.displayName} ${result.source.version}` : "已是最新版本", "good");
+      } catch (error) {
+        sourcesResult(sourceFailure(error), "bad");
       }
       await loadSources();
     }
@@ -1305,7 +1348,16 @@
       const row = el("li", "source" + (bad ? " bad" : ""));
       const name = el("div");
       const platforms = Object.keys(source.platforms).map(platform => platformNames[platform] || platform).join("、");
-      name.append(el("b", "", `${source.name} ${source.version}`), el("small", "", [platforms, state].filter(Boolean).join(" · ")));
+      const displayName = source.displayName || source.name;
+      name.append(
+        el("b", "", displayName),
+        el("small", "", [source.name, source.version, source.author, source.originHost ? `链接 ${source.originHost}` : "上传的文件"].filter(Boolean).join(" · ")),
+        el("small", "", [platforms, state].filter(Boolean).join(" · ")),
+      );
+      if (source.updateMessage) {
+        name.append(el("small", "", "有新版本"), el("small", "", source.updateMessage));
+      }
+      if (source.lastCheckedAt) name.append(el("small", "", sourceCheck(source)));
       if (sourceNotes.has(source.id)) name.append(el("small", "", sourceNotes.get(source.id)));
       row.append(name, el("span", "", `${source.used} / ${source.dailyQuota}`));
       const quota = el("input");
@@ -1316,7 +1368,7 @@
       quota.inputMode = "numeric";
       quota.value = String(source.dailyQuota);
       quota.title = "每天额度（0 = 暂停）";
-      quota.setAttribute("aria-label", `${source.name} 每天额度`);
+      quota.setAttribute("aria-label", `${displayName} 每天额度`);
       quota.addEventListener("change", () => {
         const value = Number(quota.value);
         if (!quota.checkValidity() || !Number.isInteger(value)) {
@@ -1343,14 +1395,29 @@
         try {
           await api(`/api/sources/${source.id}`, { method: "DELETE" });
           sourceNotes.delete(source.id);
-          sourcesResult(`已删除 ${source.name}`, "good");
+          sourcesResult(`已删除 ${displayName}`, "good");
         } catch (error) {
           sourcesResult(error.message === "403" ? "只能在家里的网络下删除" : "没删成", "bad");
         }
         await loadSources();
       });
       const actions = el("div", "row-actions");
-      actions.append(button(source.enabled ? "停用" : "启用", () => changeSource(source.id, { enabled: !source.enabled })), quota, up, down, test, remove);
+      actions.append(button(source.enabled ? "停用" : "启用", () => changeSource(source.id, { enabled: !source.enabled })), quota, up, down, test);
+      if (source.originHost || source.hasUpdateURL) actions.append(button("更新", () => replaceSource(source.id, "refresh")));
+      actions.append(button("换文件", () => {
+        $("sources-replace-file").dataset.sourceId = source.id;
+        $("sources-replace-file").click();
+      }));
+      if (source.hasPrevious) actions.append(button("退回上一版", () => replaceSource(source.id, "rollback")));
+      actions.append(button("备注", () => {
+        const alias = window.prompt("备注名（最多 32 字，留空恢复音源名）", source.alias || "");
+        if (alias === null) return;
+        if (Array.from(alias.trim()).length > 32) {
+          sourcesResult("备注最多 32 字", "bad");
+          return;
+        }
+        changeSource(source.id, { alias });
+      }), remove);
       row.append(actions);
       return row;
     }
@@ -1450,6 +1517,8 @@
     }
     function closeSources() {
       ++sourcesRequest;
+      $("sources-url").value = "";
+      $("sources-import-form").hidden = true;
       $("sources-drawer").classList.remove("open");
       $("sources-drawer").setAttribute("aria-hidden", "true");
       $("scrim").classList.remove("show");
@@ -1461,6 +1530,48 @@
     $("sources-open").addEventListener("click", openSources);
     $("sources-close").addEventListener("click", closeSources);
     $("sources-add").addEventListener("click", () => $("sources-file").click());
+    $("sources-import").addEventListener("click", () => {
+      $("sources-import-form").hidden = false;
+      $("sources-url").focus();
+    });
+    $("sources-import-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const url = $("sources-url").value;
+      $("sources-url").value = "";
+      $("sources-import-confirm").disabled = true;
+      sourcesResult("正在导入并加载…");
+      try {
+        const source = await api("/api/sources/import", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }),
+        });
+        sourcesResult(source.loadError ? `已导入，但加载失败：${sourceReason(source.loadError)}`
+          : `${source.existing ? "已刷新已有音源" : "已导入"} ${source.displayName} ${source.version}`, source.loadError ? "bad" : "good");
+        $("sources-import-form").hidden = true;
+      } catch (error) {
+        sourcesResult(sourceFailure(error), "bad");
+      } finally {
+        $("sources-import-confirm").disabled = false;
+      }
+      await loadSources();
+    });
+    $("sources-replace-file").addEventListener("change", async () => {
+      const input = $("sources-replace-file");
+      const file = input.files[0], id = input.dataset.sourceId;
+      input.value = "";
+      if (!file || !id) return;
+      if (file.size > 1048576) {
+        sourcesResult("脚本太大，不能超过 1 MB", "bad");
+        return;
+      }
+      let script;
+      try {
+        script = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
+      } catch {
+        sourcesResult("脚本要是 UTF-8 编码的文本", "bad");
+        return;
+      }
+      await replaceSource(id, "replace", { script });
+    });
     $("sources-file").addEventListener("change", async () => {
       const file = $("sources-file").files[0];
       $("sources-file").value = "";
@@ -1482,7 +1593,7 @@
         const source = await api("/api/sources", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ script }),
         });
-        if (source.enabled) sourcesResult(`已添加 ${source.name} ${source.version}`, "good");
+        if (source.enabled) sourcesResult(`已添加 ${source.displayName} ${source.version}`, "good");
         else sourcesResult(`已添加，但加载失败：${sourceReason(source.loadError)}`, "bad");
       } catch (error) {
         sourcesResult({

@@ -13,8 +13,9 @@ import threading
 import time
 from pathlib import Path
 
+from . import lxnet
 from .log import LOGGER
-from .lxhost import RunnerError
+from .lxhost import RunnerError, source_url, update_alert
 
 MAX_SCRIPT_BYTES = 1_048_576
 DEFAULT_QUOTA = 1000
@@ -83,13 +84,31 @@ def write_private(path, data):
     os.replace(temporary, path)
 
 
+def _redact_links(value, entry):
+    for name in ("originURL", "updateURL"):
+        url = entry.get(name)
+        if url:
+            value = value.replace(url, lxnet.host_of(url))
+    return value
+
+
 def _entry(saved):
     """One index.json entry as stored, or None when it is not one."""
     if not isinstance(saved, dict) or not isinstance(saved.get("id"), str) or not SOURCE_ID.fullmatch(saved["id"]):
         return None
     entry = {"id": saved["id"]}
-    for name in ("name", "version", "author", "description", "homepage", "sha256", "loadError"):
+    for name in (
+        "name", "version", "author", "description", "homepage", "sha256", "loadError",
+        "previousVersion", "lastCheckResult",
+    ):
         entry[name] = saved.get(name) if isinstance(saved.get(name), str) else ""
+    entry["originURL"] = source_url(saved.get("originURL")) or ""
+    entry["updateURL"] = source_url(saved.get("updateURL"), trim_first=False) or ""
+    entry["alias"] = saved.get("alias", "").strip()[:32] if isinstance(saved.get("alias"), str) else ""
+    message = saved.get("updateMessage")
+    entry["updateMessage"] = message.strip()[:1024] if isinstance(message, str) else ""
+    for name in ("updatedAt", "updateAlertAt", "lastCheckedAt"):
+        entry[name] = saved.get(name) if type(saved.get(name)) is int else 0
     entry["enabled"] = saved.get("enabled") is True
     quota = saved.get("dailyQuota")
     entry["dailyQuota"] = quota if type(quota) is int and 0 <= quota <= MAX_QUOTA else DEFAULT_QUOTA
@@ -112,12 +131,14 @@ class SourceStore:
     waits for them.
     """
 
-    def __init__(self, data, runner):
+    def __init__(self, data, runner, *, allow_private=False, fetch=lxnet.perform):
         self._directory = Path(data) / "sources"
         self._index = self._directory / "index.json"
         self._runner = runner
+        self._allow_private = allow_private
+        self._fetch = fetch
         self._lock = threading.Lock()
-        self._ops = threading.Lock()
+        self._ops = threading.RLock()
         # Sources whose loads hung or killed the runner: left alone until switched on again.
         self._suspects = {}
         self._quarantined = set()
@@ -145,6 +166,9 @@ class SourceStore:
     def _script_path(self, source_id):
         return self._directory / f"{source_id}.js"
 
+    def _previous_path(self, source_id):
+        return self._directory / f"{source_id}.prev.js"
+
     def _sorted(self):
         return sorted(self._entries.values(), key=lambda entry: (entry["order"], entry["addedAt"], entry["id"]))
 
@@ -161,15 +185,90 @@ class SourceStore:
         """Every source's details, with whether it is loaded right now; never a script."""
         loaded = self._runner.loaded()
         with self._lock:
-            return [{**entry, "platforms": dict(entry["platforms"]), "loaded": entry["id"] in loaded}
+            return [{**self._public(entry), "loaded": entry["id"] in loaded}
                     for entry in self._sorted()]
+
+    def _public(self, entry):
+        """Links can contain a provider's password; only their presence and host leave the store."""
+        result = {key: value for key, value in entry.items() if key not in ("originURL", "updateURL")}
+        result.update(
+            platforms=dict(entry["platforms"]),
+            originHost=lxnet.host_of(entry["originURL"]) if entry["originURL"] else "",
+            hasUpdateURL=bool(entry["updateURL"]),
+            hasPrevious=self._previous_path(entry["id"]).is_file(),
+            displayName=entry["alias"] or entry["name"],
+        )
+        # The update message is script text too: a script may repeat its URL in it.
+        for key, value in result.items():
+            if isinstance(value, str):
+                result[key] = _redact_links(value, entry)
+        return result
 
     def get(self, source_id):
         with self._lock:
             entry = self._entries.get(source_id)
-            return None if entry is None else {**entry, "platforms": dict(entry["platforms"])}
+            return None if entry is None else self._public(entry)
 
-    def add(self, script):
+    def _raw(self, source_id):
+        with self._lock:
+            entry = self._entries.get(source_id)
+            if entry is None:
+                raise SourceError("not_found", 404)
+            return dict(entry)
+
+    def _fetch_script(self, value):
+        url = source_url(value)
+        if url is None:
+            raise SourceError("invalid_url")
+        reply = self._fetch(url, {"method": "GET", "timeout": 15000}, allow_private=self._allow_private)
+        error = reply.error
+        if not error and not (reply.status is not None and 200 <= reply.status < 300):
+            error = f"http_{reply.status}"
+        if not error and not reply.body_text:
+            error = "empty_response"
+        if error:
+            LOGGER.warning("SOURCE-FETCH host=%s error=%s", lxnet.host_of(url), error)
+            raise SourceError("fetch_failed", 502)
+        try:
+            reply.body_text.encode("utf-8")
+        except UnicodeEncodeError:
+            LOGGER.warning("SOURCE-FETCH host=%s error=empty_response", lxnet.host_of(url))
+            raise SourceError("fetch_failed", 502) from None
+        return url, reply.body_text
+
+    def import_url(self, value):
+        url, script = self._fetch_script(value)
+        data = script.encode("utf-8")
+        inspect(data)
+        digest = hashlib.sha256(data).hexdigest()
+        with self._ops:
+            with self._lock:
+                existing = next((dict(entry) for entry in self._entries.values() if entry["sha256"] == digest), None)
+            if existing is not None:
+                # iOS processLXSource refreshes the existing id with enable: true.
+                source_id = existing["id"]
+                platforms, error = self._load(existing, script)
+                if error is not None:
+                    if existing["enabled"]:
+                        self._load(existing, script)
+                    else:
+                        self._runner.unload(source_id)
+                    with self._lock:
+                        self._entries[source_id]["loadError"] = error
+                        self._save()
+                    raise SourceError("update_failed", 409)
+                with self._lock:
+                    self._entries[source_id].update(
+                        enabled=True, platforms=platforms, loadError="", originURL=url,
+                        lastCheckedAt=int(time.time()), lastCheckResult="same",
+                    )
+                    self._save()
+                self._suspects.pop(source_id, None)
+                self._quarantined.discard(source_id)
+                return {**self.get(source_id), "existing": True}
+            return self.add(script, origin_url=url)
+
+    def add(self, script, *, origin_url=""):
         """Stores a new script and loads it. A script that fails to load is kept, switched off,
         with the reason."""
         if not isinstance(script, str):
@@ -191,6 +290,10 @@ class SourceStore:
             entry = {
                 "id": source_id, **meta, "sha256": digest, "enabled": False, "dailyQuota": DEFAULT_QUOTA,
                 "order": last + 1, "platforms": {}, "addedAt": int(time.time()), "loadError": "",
+                "originURL": origin_url, "alias": "", "updatedAt": 0, "previousVersion": "",
+                "updateMessage": "", "updateURL": "", "updateAlertAt": 0,
+                "lastCheckedAt": int(time.time()) if origin_url else 0,
+                "lastCheckResult": "updated" if origin_url else "",
             }
             try:
                 platforms, error = self._load(entry, script)
@@ -210,11 +313,13 @@ class SourceStore:
     def update(self, source_id, body):
         """Switches a source on or off, sets its daily quota, or moves it to another place."""
         enabled, quota, order = body.get("enabled"), body.get("dailyQuota"), body.get("order")
+        alias = body.get("alias")
         if (
             (enabled is not None and not isinstance(enabled, bool))
             or (quota is not None and (type(quota) is not int or not 0 <= quota <= MAX_QUOTA))
             or (order is not None and (type(order) is not int or order < 0))
-            or (enabled is None and quota is None and order is None)
+            or ("alias" in body and (not isinstance(alias, str) or len(alias.strip()) > 32))
+            or (enabled is None and quota is None and order is None and alias is None)
         ):
             raise SourceError("bad_request")
         with self._ops:
@@ -234,6 +339,8 @@ class SourceStore:
                 changes["enabled"] = False
             if quota is not None:
                 changes["dailyQuota"] = quota
+            if alias is not None:
+                changes["alias"] = alias.strip()
             with self._lock:
                 entry = self._entries.get(source_id)
                 if entry is None:
@@ -252,6 +359,146 @@ class SourceStore:
         )
         return self.get(source_id)
 
+    def replace(self, source_id, script, *, origin="upload"):
+        """Try the new script at the same id before replacing the private file."""
+        with self._ops:
+            current = self._raw(source_id)
+            meta = None
+            try:
+                if not isinstance(script, str):
+                    raise SourceError("invalid_script")
+                try:
+                    data = script.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise SourceError("invalid_script") from None
+                meta = inspect(data)
+                digest = hashlib.sha256(data).hexdigest()
+                with self._lock:
+                    if any(entry["id"] != source_id and entry["sha256"] == digest for entry in self._entries.values()):
+                        raise SourceError("duplicate", 409)
+                if current["sha256"] == digest:
+                    if origin in ("link", "alert", "auto"):
+                        self._checked(source_id, "same")
+                    LOGGER.info(
+                        "SOURCE-REPLACE id=%s from=%s old=%s new=%s ok=是 error=",
+                        source_id, origin, _redact_links(current["version"], current), _redact_links(meta["version"], current),
+                    )
+                    return {"changed": False, "source": self.get(source_id)}
+                old_script = self._read_script(source_id)
+                platforms, error = self._load({**current, **meta}, script)
+                if error is not None:
+                    if current["enabled"]:
+                        self._load(current, old_script)
+                    else:
+                        self._runner.unload(source_id)
+                    with self._lock:
+                        self._entries[source_id]["loadError"] = error
+                        self._save()
+                    raise SourceError("update_failed", 409)
+                if not current["enabled"]:
+                    self._runner.unload(source_id)
+                path = self._script_path(source_id)
+                os.chmod(path, 0o600)
+                os.replace(path, self._previous_path(source_id))
+                try:
+                    write_private(path, data)
+                except OSError:
+                    write_private(path, old_script.encode("utf-8"))
+                    if current["enabled"]:
+                        self._load(current, old_script)
+                    raise SourceError("save_failed", 500) from None
+                with self._lock:
+                    self._entries[source_id].update(
+                        **meta, sha256=digest, platforms=platforms, updatedAt=int(time.time()),
+                        previousVersion=current["version"], updateMessage="", updateURL="", updateAlertAt=0,
+                        loadError="",
+                    )
+                    self._save()
+                self._suspects.pop(source_id, None)
+                self._quarantined.discard(source_id)
+            except SourceError as failure:
+                LOGGER.info(
+                    "SOURCE-REPLACE id=%s from=%s old=%s new=%s ok=否 error=%s",
+                    source_id, origin, _redact_links(current["version"], current),
+                    _redact_links(meta["version"], current) if meta else "-", failure.code,
+                )
+                raise
+            LOGGER.info(
+                "SOURCE-REPLACE id=%s from=%s old=%s new=%s ok=是 error=",
+                source_id, origin, _redact_links(current["version"], current), _redact_links(meta["version"], current),
+            )
+            return {"changed": True, "source": self.get(source_id)}
+
+    def rollback(self, source_id):
+        with self._ops:
+            self._raw(source_id)
+            path = self._previous_path(source_id)
+            if not path.is_file():
+                raise SourceError("no_previous", 409)
+            return self.replace(source_id, path.read_bytes().decode("utf-8"), origin="rollback")
+
+    def _checked(self, source_id, result):
+        with self._lock:
+            self._entries[source_id].update(lastCheckedAt=int(time.time()), lastCheckResult=result)
+            self._save()
+
+    def refresh(self, source_id):
+        with self._ops:
+            current = self._raw(source_id)
+            url = current["updateURL"] or current["originURL"]
+            if not url:
+                raise SourceError("no_update_url", 409)
+            try:
+                url, script = self._fetch_script(url)
+                answer = self.replace(source_id, script, origin="alert" if current["updateURL"] else "link")
+            except SourceError as error:
+                self._checked(source_id, error.code)
+                raise
+            with self._lock:
+                self._entries[source_id].update(
+                    originURL=url, updateURL="", updateMessage="", updateAlertAt=0,
+                    lastCheckedAt=int(time.time()), lastCheckResult="updated" if answer["changed"] else "same",
+                )
+                self._save()
+            return {**answer, "source": self.get(source_id)}
+
+    def note_alert(self, source_id, message, update_url):
+        alert = update_alert({"log": message, "updateUrl": update_url})
+        if alert is None:
+            return
+        message, url = alert
+        url = url or ""
+        with self._ops, self._lock:
+            entry = self._entries.get(source_id)
+            if entry is None or (entry["updateMessage"], entry["updateURL"]) == (message, url):
+                return
+            entry.update(updateMessage=message, updateURL=url, updateAlertAt=int(time.time()))
+            self._save()
+        LOGGER.info("SOURCE-ALERT id=%s host=%s", source_id, lxnet.host_of(url) if url else "-")
+
+    def auto_check(self):
+        """One origin link per 10-minute cycle; an alert link is only followed by refresh()."""
+        with self._ops:
+            with self._lock:
+                current = next((
+                    dict(entry) for entry in self._sorted()
+                    if entry["originURL"] and time.time() - entry["lastCheckedAt"] >= 86400
+                ), None)
+            if current is None:
+                return
+            source_id = current["id"]
+            try:
+                _, script = self._fetch_script(current["originURL"])
+                if hashlib.sha256(script.encode("utf-8")).hexdigest() == current["sha256"]:
+                    result = "same"
+                else:
+                    answer = self.replace(source_id, script, origin="auto")
+                    result = "updated" if answer["changed"] else "same"
+            except SourceError as error:
+                result = error.code
+            self._checked(source_id, result)
+            LOGGER.info("SOURCE-AUTO-CHECK id=%s result=%s", source_id, result)
+
     def delete(self, source_id):
         with self._ops:
             with self._lock:
@@ -265,6 +512,7 @@ class SourceStore:
             self._suspects.pop(source_id, None)
             self._quarantined.discard(source_id)
             self._script_path(source_id).unlink(missing_ok=True)
+            self._previous_path(source_id).unlink(missing_ok=True)
         LOGGER.info("SOURCE-DELETE id=%s", source_id)
 
     def ensure_loaded(self, source_id):

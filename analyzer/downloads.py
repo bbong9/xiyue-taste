@@ -185,6 +185,12 @@ class Downloads:
         minimum = body.get("minDurationMs", 0)
         if type(minimum) is not int or not 0 <= minimum <= 86_400_000:
             raise DownloadError("bad_request")
+        source_name = body.get("sourceName", "")
+        if not isinstance(source_name, str):
+            raise DownloadError("bad_request")
+        source_name = source_name.strip()
+        if len(source_name) > 64:
+            raise DownloadError("bad_request")
         job = {
             "id": uuid.uuid4().hex,
             "filename": _filename(body.get("filename")),
@@ -194,6 +200,7 @@ class Downloads:
             "createdAt": time.time(), "finishedAt": None,
             "format": "", "durationMs": 0, "sampleRate": 0, "bitDepth": 0, "bitRate": 0,
             "minDurationMs": minimum,
+            "sourceName": source_name,
             "url": url,
             "userAgent": _text(body.get("userAgent", ""), 500),
             "referer": _text(body.get("referer", ""), 2000),
@@ -217,7 +224,7 @@ class Downloads:
 
     def snapshot(self):
         names = ("id", "filename", "directory", "state", "received", "total", "error", "path", "host",
-                 "createdAt", "finishedAt", "format", "durationMs", "sampleRate", "bitDepth", "bitRate")
+                 "createdAt", "finishedAt", "format", "durationMs", "sampleRate", "bitDepth", "bitRate", "sourceName")
         with self._lock:
             return [{name: job[name] for name in names} for job in list(self._jobs.values())[::-1][:100]]
 
