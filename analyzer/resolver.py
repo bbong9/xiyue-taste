@@ -17,6 +17,7 @@ import secrets
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import lxnet
@@ -498,11 +499,27 @@ class Resolver:
 
     # The phone's side.
 
+    def capabilities(self):
+        platforms = {}
+        for entry in self._sources.list():
+            if not entry["enabled"] or entry["dailyQuota"] <= 0:
+                continue
+            for platform, qualities in entry["platforms"].items():
+                if platform in PLATFORMS:
+                    platforms.setdefault(platform, set()).update(qualities)
+        return {"platforms": {
+            platform: ordered for platform, qualities in platforms.items()
+            if (ordered := [quality for quality in QUALITIES if quality in qualities])
+        }}
+
     def resolve(self, body, account):
         """POST /api/source/resolve: the address itself, or a relay path standing in for it."""
         request = _request(body)
         transport = self.transports.mode(request.platform)
         found, _ = self._logged(request, account, transport)
+        if transport == "direct" and urlsplit(found.url).scheme == "http":
+            transport = "relay"
+            LOGGER.info("SOURCE-RESOLVE http_relay platform=%s", request.platform)
         answer = {
             "quality": found.quality, "sourceID": found.source_id, "sourceName": found.source_name,
             "transport": transport,

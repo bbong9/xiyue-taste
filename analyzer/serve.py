@@ -148,6 +148,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self._send_json({"error": "source_unconfigured"}, 503)
         elif path.startswith(_STREAM_PREFIX):
             self._relay(path[len(_STREAM_PREFIX):])
+        elif path == "/api/source/capabilities":
+            self._send_json(self._resolver.capabilities())
         elif path not in ("/api/sources", "/api/source/limits", "/api/source/usage"):
             self._send_json({"error": "not_found"}, 404)
         elif self._home_only():
@@ -210,7 +212,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         try:
             stream = self._resolver.open_stream(ticket, self.headers.get("Range"))
         except ResolveError as error:
-            self._send_json({"error": error.code}, error.status)
+            if error.code == "not_found" and not self._authorized():
+                self._send_json({"error": "unauthorized"}, 401)
+            else:
+                self._send_json({"error": error.code}, error.status)
             return
         try:
             # A phone that stops reading for a minute lets its slot go.
@@ -229,6 +234,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = unquote(urlsplit(self.path).path)
+        if path.startswith(_STREAM_PREFIX):
+            self._get_source(path)
+            return
         if path not in ("/", "/index.html") and not self._authorized():
             self._send_json({"error": "unauthorized"}, 401)
             return

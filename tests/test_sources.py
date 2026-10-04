@@ -564,7 +564,8 @@ def test_runner_steps_down_past_an_encrypted_tier_unless_exact(tmp_path, node_ru
     upstream.answer = lambda tag, platform, quality: f"/media/{quality}." + ("mflac" if quality == "flac" else "mp3")
 
     found = resolver.resolve(_song("kw", "1001", "flac"), OWNER)
-    assert (found["quality"], found["transport"], found["url"]) == ("320k", "direct", upstream.url("/media/320k.mp3"))
+    assert (found["quality"], found["transport"]) == ("320k", "relay")
+    assert resolver._tickets[found["path"].rsplit("/", 1)[1]].url == upstream.url("/media/320k.mp3")
     assert [item[1:] for item in upstream.resolved] == [("kw", "flac", "1001"), ("kw", "320k", "1001")]
 
     upstream.resolved.clear()
@@ -750,7 +751,9 @@ def test_resolver_cache_hits_call_no_source_and_count_a_play_once(tmp_path):
     clock = _Clock()
     runner, store, resolver = _stubbed(tmp_path, clock)
     _add(store, runner, "A")
-    runner.answer = lambda name, platform, tier, info: _url(platform, info, tier, "mflac" if tier == "flac" else "mp3")
+    runner.answer = lambda name, platform, tier, info: _url(
+        platform, info, tier, "mflac" if tier == "flac" else "mp3",
+    ).replace("http://", "https://", 1)
 
     first = resolver.resolve(_song("kw", "1", "flac"), OWNER)
     assert first["quality"] == "320k"
@@ -801,6 +804,52 @@ def test_resolver_counts_start_over_at_shanghai_midnight(tmp_path):
 
 
 # Relaying.
+
+@pytest.mark.parametrize("scheme,transport", [("http", "relay"), ("https", "direct")])
+def test_resolver_relays_http_without_changing_the_platform_mode(tmp_path, scheme, transport, logged):
+    runner, store, resolver = _stubbed(tmp_path)
+    _add(store, runner, "A")
+    address = f"{scheme}://127.0.0.1:9/song.mp3"
+    runner.answer = lambda *args: address
+
+    answer = resolver.resolve(_song("kw", "1"), OWNER)
+
+    assert answer["transport"] == transport
+    assert resolver.transports.mode("kw") == "direct"
+    if transport == "relay":
+        assert answer["path"].startswith("/api/source/stream/") and "url" not in answer
+        assert "SOURCE-RESOLVE http_relay platform=kw" in "\n".join(logged)
+    else:
+        assert answer["url"] == address and "path" not in answer
+    assert address not in "\n".join(logged)
+
+
+def test_relay_valid_ticket_needs_no_password(tmp_path, upstream, monkeypatch):
+    monkeypatch.setattr(_Handler, "_is_trusted", lambda self: False)
+    clock = _Clock()
+    runner, store, resolver = _stubbed(tmp_path, clock)
+    _add(store, runner, "A")
+    upstream.media["song.mp3"] = ("audio/mpeg", b"ID3" + bytes(100))
+    runner.answer = lambda *args: upstream.url("/media/song.mp3")
+    path = resolver.resolve(_song("kg", "1"), OWNER)["path"]
+    access = AccessSettings(None, token=TOKEN)
+    signed = {"Authorization": "Bearer " + TOKEN}
+
+    with _container(tmp_path, store, resolver, access=access) as port:
+        status, _, body = _call(port, "GET", path)
+        assert (status, body) == (200, b"ID3" + bytes(100))
+        for missing in ("", "invalid", "a" * 43):
+            target = "/api/source/stream/" + missing
+            status, _, body = _call(port, "GET", target)
+            assert (status, json.loads(body)) == (401, {"error": "unauthorized"})
+            status, _, body = _call(port, "GET", target, headers=signed)
+            assert (status, json.loads(body)) == (404, {"error": "not_found"})
+        clock.advance(TICKET_SECONDS)
+        status, _, body = _call(port, "GET", path)
+        assert (status, json.loads(body)) == (401, {"error": "unauthorized"})
+        status, _, body = _call(port, "GET", path, headers=signed)
+        assert (status, json.loads(body)) == (404, {"error": "not_found"})
+
 
 def test_relay_passes_range_through_and_tells_flac_by_its_head(tmp_path, upstream, monkeypatch, logged):
     monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
@@ -916,6 +965,60 @@ def test_relay_holds_six_streams_and_lets_go_when_the_phone_hangs_up(tmp_path, u
 
 # The endpoints.
 
+def test_source_capabilities_union_qualities_in_order(tmp_path):
+    runner, store, resolver = _stubbed(tmp_path)
+    _add(store, runner, "A", {"kw": ("flac", "128k")})
+    _add(store, runner, "B", {"kw": ("320k", "flac")})
+
+    assert resolver.capabilities() == {"platforms": {"kw": ["128k", "320k", "flac"]}}
+
+
+def test_source_capabilities_exclude_disabled_and_zero_quota(tmp_path):
+    runner, store, resolver = _stubbed(tmp_path)
+    disabled = _add(store, runner, "disabled", {"kw": ("flac",)})
+    store.update(disabled, {"enabled": False})
+    _add(store, runner, "zero", {"tx": ("320k",)}, quota=0)
+    _add(store, runner, "enabled", {"kw": ("128k",)})
+
+    assert resolver.capabilities() == {"platforms": {"kw": ["128k"]}}
+
+
+def test_source_capabilities_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
+    _, store, resolver = _stubbed(tmp_path)
+    with _container(tmp_path, store, resolver) as port:
+        status, _, data = _call(port, "GET", "/api/source/capabilities")
+    assert (status, json.loads(data)) == (200, {"platforms": {}})
+
+
+def test_source_capabilities_only_publish_known_platforms_and_qualities(tmp_path, monkeypatch):
+    _, store, resolver = _stubbed(tmp_path)
+    monkeypatch.setattr(store, "list", lambda: [{
+        "enabled": True, "dailyQuota": 100, "name": "private", "id": "private-id",
+        "platforms": {"kw": ["unknown", "128k"], "other": ["320k"], "tx": ["unknown"]},
+    }])
+
+    answer = resolver.capabilities()
+    assert set(answer) == {"platforms"}
+    assert answer == {"platforms": {"kw": ["128k"]}}
+
+
+def test_source_capabilities_need_a_token_outside_but_not_home_only(tmp_path, logged):
+    runner, store, resolver = _stubbed(tmp_path)
+    _add(store, runner, "A", {"kw": ("320k",)})
+    access = AccessSettings(None, token=TOKEN, network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2")
+    outside = {"X-Forwarded-For": "203.0.113.9"}
+    signed = {**outside, "Authorization": "Bearer " + TOKEN}
+
+    with _container(tmp_path, store, resolver, access=access) as port:
+        status, _, data = _call(port, "GET", "/api/source/capabilities", headers=outside)
+        assert (status, json.loads(data)) == (401, {"error": "unauthorized"})
+        logged.clear()
+        status, _, data = _call(port, "GET", "/api/source/capabilities", headers=signed)
+        assert (status, json.loads(data)) == (200, {"platforms": {"kw": ["320k"]}})
+        assert logged == []
+
+
 def test_source_endpoints_need_a_token_outside_and_the_panel_stays_home(tmp_path, upstream, monkeypatch, logged):
     monkeypatch.setattr(serve, "_auth_rejections", {})
     runner, store, resolver = _stubbed(tmp_path)
@@ -929,7 +1032,7 @@ def test_source_endpoints_need_a_token_outside_and_the_panel_stays_home(tmp_path
 
     with _container(tmp_path, store, resolver, access=access) as port:
         for method, target, body in (
-            ("GET", path, None),
+            ("GET", "/api/source/stream/invalid", None),
             ("POST", "/api/source/resolve", _song("kw", "2")),
             ("GET", "/api/sources", None),
         ):
@@ -948,7 +1051,7 @@ def test_source_endpoints_need_a_token_outside_and_the_panel_stays_home(tmp_path
             status, _, data = _call(port, method, target, body, signed)
             assert (status, json.loads(data)) == (403, {"error": "home_only"}), target
         status, _, data = _call(port, "POST", "/api/source/resolve", _song("kw", "2"), signed)
-        assert (status, json.loads(data)["transport"]) == (200, "direct")
+        assert (status, json.loads(data)["transport"]) == (200, "relay")
         status, _, data = _call(port, "GET", path, None, signed)
         assert (status, data) == (200, bytes(100))
         assert "authorization" not in upstream.requests[-1][1]
