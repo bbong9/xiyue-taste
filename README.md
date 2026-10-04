@@ -1,136 +1,78 @@
-# 汐乐曲库分析与分析台容器
+# 汐乐容器（xiyue-taste）
 
-一个容器 `xiyue-taste` 同时运行曲库分析和网页分析台：只读扫描音乐目录，将音频特征、标签、歌词语种和每首歌最相近的 20 首写入 `xiyue-taste-v1.json.gz`，在局域网提供分析状态、曲库画像、曲目详情及 App 结果下载。曲库分析不调用外部 API，不修改音乐文件或标签。
+汐乐是一款 iOS 音乐播放器。这个容器装在家里的 NAS 上，给汐乐提供“家里的那一半”：音源放在 NAS 上，全家共用，各用各的账号；要存的歌由 NAS 自己下载进曲库；顺带分析你的音乐库，让汐乐懂你爱听什么。
 
-## 在 NAS 上部署
+```
+docker pull bbong9/xiyue-taste:latest
+```
 
-1. 在 NAS 上安装并启动 Docker（飞牛、群晖、极空间等能跑容器的都行）。只需要 `docker-compose.hub.yml` 一个文件，把它放进一个英文名文件夹，例如 `taste-analyzer`，不用准备源码或 `.env`。
-2. 打开这个文件，只改 `x-music: &music /volume1/music` 这一行，把 `/volume1/music` 换成音乐库在 NAS 上的真实路径。
-3. 在文件所在目录执行：
+支持 `linux/amd64` 和 `linux/arm64`。飞牛、群晖、极空间，能跑 Docker 的 NAS 都能用。
+
+## 能做什么
+
+| 功能 | 说明 |
+|---|---|
+| **家里音源** | 音源脚本只放在 NAS 上，手机不用装音源也能播放和下载。几个音源轮着用，家人有每天的限额 |
+| **下载到 NAS** | 在汐乐里点“下载到 NAS”，NAS 自己去下，存进音乐库；NAS 下不了时，手机下好再传上去 |
+| **家人账户** | 每人用自己的名字和密码登录汐乐，收听记录、喜欢和歌单各存各的。一个账号同一时间只能一台设备在线 |
+| **懂你** | 分析音乐库里每首歌的听感（节奏、能量、音色等），给汐乐做“相似歌曲”和推荐 |
+| **AI 找歌** | 说一句“下雨天安静一点的”，从曲库里挑歌，也推荐平台上的歌。要自己填一个模型服务商的密钥 |
+
+所有设置都在网页面板里点，不用改配置文件。
+
+## 部署
+
+1. 在 NAS 上新建一个英文名的文件夹，比如 `xiyue-taste`，把 [`docker-compose.hub.yml`](docker-compose.hub.yml) 放进去。
+2. 打开它，只改一行：把 `x-music: &music /volume1/music` 里的路径换成你的音乐库路径。端口 `8790` 不要改，汐乐固定连这个端口。
+3. 在这个文件夹里执行：
 
    ```bash
    docker compose -f docker-compose.hub.yml pull
    docker compose -f docker-compose.hub.yml up -d
    ```
 
-4. 在家里用浏览器打开 `http://NAS的内网IP:8790`，依次设好“连接设置”“家人账户”“音源”（“AI 设置”可选）。以后更新也执行上面两条命令。
+以后更新也是这两条命令。设置、账户、音源和密钥都存在文件夹里的 `data/`，更新和重装都不会丢。
 
-音乐库以只读方式挂载到 `/music` 用于分析，同一音乐库也挂载到 `/downloads` 接收 App 交给 NAS 下载的歌。设置和缓存保存在本目录的 `data/`，分析结果保存在 `out/`；重装容器时保留这两个目录。容器使用 2 个分析进程，限制为 2 CPU、2 GB 内存。启动后扫描一次，随后每隔 24 小时再扫描。
+容器限制为 2 个 CPU 核、2 GB 内存。启动后先扫一遍音乐库，之后每 24 小时扫一次。音乐库只读挂载给分析用；下载功能只往里新增歌曲，不改、不删已有的文件。
 
-也可以用环境变量（老办法）：`TASTE_ACCESS_TOKEN`、`TASTE_TRUSTED_NETWORK`、`TASTE_HOST_IP`、`TASTE_LLM_API_KEY`、`TASTE_LLM_BASE_URL`、`TASTE_LLM_MODEL`。原有部署方式仍可用，面板保存的设置优先于环境变量。
+## 在面板里设置
 
-## 手动扫描一次
+在家里的网络下，用浏览器打开 `http://NAS的内网IP:8790`，比如 `http://192.168.1.10:8790`。第一次请用 IP 打开，不要用 `.local` 这类名字，也别开代理，否则面板认不出你在家。
 
-在分析台点「立即扫描」。扫描期间再次提交请求，会在本轮结束后立即触发下一轮。
+按顺序设置：
 
-Python 命令行也可以独立运行：
+1. **连接设置**：填 NAS 的内网 IP 和家里网段（比如 `192.168.1.0/24`）。访问口令只在离家用浏览器打开面板时需要，可以不设。
+2. **家人账户**：先给主账户（你自己）设登录名和密码，再给家人建账号。
+3. **音源**：上传 `.js` 音源脚本，或从链接导入，再设好家人每天能下载、播放多少首。
+4. **AI 设置**（可选）：选服务商，填密钥。硅基流动、DeepSeek、通义、豆包、智谱、Kimi、OpenAI 等 OpenAI 兼容接口都行。
 
-```bash
-python -m analyzer scan --music /music --data /data --out /out --workers 2
-python -m analyzer loop --music /music --data /data --out /out --workers 2 --interval-hours 24
-python -m analyzer run --music /music --data /data --out /out --workers 2 --interval-hours 24 --port 8790
-```
+“家人账户”和“音源”只有在家里打开面板才能看到和修改。
 
-`--workers` 默认 2；`loop` 和 `run` 的 `--interval-hours` 默认 24。`run` 在同一个服务进程里提供 HTTP，并使用后台线程处理请求；扫描工作使用独立分析进程。
+## 在汐乐里登录
 
-## 分析台和结果下载
+汐乐 1.2.66 及以后：进入“设置”，点最上面的“登录汐乐账号”。
 
-现在只有一个容器 `xiyue-taste`，在 8790 端口同时提供分析台和结果下载，只绑定 IPv4。输出目录可写，扫描结束会更新结果文件。
+- **连了飞牛音乐**：汐乐会自动找到飞牛音乐那台 NAS 上的容器，不用填家里地址。
+- **没连飞牛音乐**：“家里地址”填 NAS 的内网 IP，不用带端口。
+- **离家也想用**：给 8790 端口做一个 https 外网地址（路由器 DDNS 加反向代理，或者用 Lucky 之类的工具），填进“外网地址”。
 
-浏览器打开 `http://<NAS 局域网 IP>:8790/` 是分析台；`http://<NAS 局域网 IP>:8790/xiyue-taste-v1.json.gz` 是汐乐 App 使用的文件。
+然后填名字和密码登录。
 
-文件响应保留 `Content-Encoding: gzip`、`Content-Type: application/json` 和 `Last-Modified`，支持 `If-Modified-Since`，文件没变时返回 304。所有 `/api/` 接口和 `.json.gz` 下载需要通过下面的访问检查；面板网页本身不含曲库数据，可以直接打开。
+要用“下载到 NAS”，还要在汐乐的“设置 → 账号与来源”里加上这台 NAS 的 WebDAV，并把默认下载位置选在音乐库文件夹里面。
 
-## 访问口令和外网连接
+## 数据和隐私
 
-在 Compose 同目录的 `.env` 中设置：
+- **音乐库**：分析在 NAS 本地完成，不上传音频，不改音乐文件和标签。
+- **音源脚本、AI 密钥、账户密码**：只存在 NAS 的 `data/` 里，面板保存后不再显示，日志里也不记。
+- **用 AI 功能时**：会把你的那句话，以及曲库里的歌名、歌手、风格、语种等，发给你自己选的模型服务商。不填密钥就不会发。
+- **音源**：容器本身不带任何音源，用的都是你自己上传的脚本。
 
-- `TASTE_ACCESS_TOKEN`：访问口令，建议用 `openssl rand -hex 24` 生成；不要写进代码、日志或提交到 Git。
-- `TASTE_TRUSTED_NETWORK`：家里的局域网网段，默认 `192.168.50.0/24`。填写无效网段时，容器启动会报 `bad TASTE_TRUSTED_NETWORK` 并退出。
-- `TASTE_HOST_IP`：NAS 自己的局域网 IP，默认 `192.168.50.2`。
+## 常见问题
 
-只有来源在信任网段内、地址最后一段不是 `1`、不是 NAS 自己，且不带 `X-Forwarded-For`、`X-Real-IP`、`Forwarded` 请求头的直连请求，才免口令。其他请求必须带 `Authorization: Bearer <访问口令>`；没有配置口令时，也只允许上述局域网直连。
+- **面板上没有“音源”“家人账户”按钮**：面板没认出你在家。请用内网 IP 打开，检查连接设置里的网段，关掉代理或 VPN。
+- **汐乐登录连不上**：先用浏览器打开面板，确认容器在运行；再确认家里地址填的是 NAS 的 IP，手机和 NAS 在同一个网络。
+- **出问题要找人看**：在面板右上角点“日志”，可以查看和下载。日志里没有口令和密钥。
 
-外网反向代理必须用 HTTPS。浏览器首次访问外网面板时，在页面顶部填写“访问口令”并保存，口令保存在这个浏览器的 `localStorage` 中。汐乐 App 不用这个口令：App 在“设置 → 汐乐账号”里填外网地址，用“家人账户”里的登录名和密码登录。
+## 开发
 
-## 说一句找歌
-
-`POST /api/ask` 接收 JSON `{"q":"下雨天安静一点的"}`，去掉首尾空白后限 1～100 字。返回 `reason` 和最多 20 个 `items`，每项包含分析结果里的 `index`、`title`、`artists`、`path`。
-
-`POST /api/ask` 可带 `"part": "library"`（只挑曲库）或 `"online"`（只推荐平台歌和歌单词，不发曲库），不带时和以前一样。
-
-Compose 从同目录的 `.env` 读取以下环境变量并传给容器：
-
-- `TASTE_LLM_API_KEY`：模型服务商的密钥，只放在 `.env`，不要写入代码、日志或提交到 Git；不填时接口返回 503。
-- `TASTE_LLM_BASE_URL`：默认 `https://api.siliconflow.cn/v1`。
-- `TASTE_LLM_MODEL`：默认 `deepseek-ai/DeepSeek-V3.2`。
-
-任何 OpenAI 兼容接口都可以，推荐在面板里填。
-
-使用此接口会把查询原文、曲库歌名、歌手、风格、语种、BPM 和响度发给模型服务商。
-
-接口也返回曲库以外的推荐歌曲 `songs`（最多 15 首，含 `title`、`artist`）和歌单搜索关键词 `playlists`（最多 3 个），由 App 去音乐平台搜索。请求可选带 `taste` 常听歌手列表，最多 20 个、每个 1～40 字，会一起发给模型。
-
-`GET /api/ask/status` 返回 `{"configured":true,"model":"模型名"}`，只说明是否配置密钥及使用的模型，不返回密钥或其片段，不访问模型服务。
-
-## 标签体检
-
-`POST /api/butler/artists` 接收 `{"artists":[{"name":"周杰倫","songs":3}]}`（1～600 个），返回同一歌手的写法分组 `groups`，中文写法优先。
-
-`POST /api/butler/songs` 接收 `{"songs":[{"id":"1","title":"夜曲 无损","album":"","artists":["周杰伦"],"path":"音乐/夜曲.flac"}]}`（1～60 首），返回 `songs` 中建议修改的 `title`、`album` 和原 `id`。
-
-两接口共用“说一句找歌”的三个环境变量，会把歌名、歌手、专辑、文件路径发给模型服务商。容器只给建议，不修改任何文件。
-
-## 下载
-
-在 `.env` 中用 `DOWNLOAD_DIR` 指定存歌目录，不填默认使用本目录下的 `downloads/`；下载及歌词、封面只写入这里，`/music` 仍只读。
-`POST /api/downloads`：必填 `url`、`filename`，可选 `directory`、`userAgent`、`referer`、`lyrics`、`cover`（base64），返回 `{"id":"任务编号"}`。
-`POST /api/downloads` 还可带 `minDurationMs`；实际音频时长低于这个值时，任务失败且不保留文件。
-文件扩展名按真实音频格式确定，任务信息会返回 `format`、`durationMs`、`sampleRate`、`bitDepth`、`bitRate`。
-`GET /api/downloads` 返回 `{"available":true,"jobs":[]}`，任务中不返回下载地址；`POST /api/downloads/cancel` 接收 `{"id":"任务编号"}`。
-`POST /api/downloads/locate` 接收 `{"name":"标记文件名"}`：手机先经自己的连接在 App 目标文件夹放入 `.xiyue-probe-<32位十六进制>` 文件，容器返回 `{"directory":"子文件夹"}`，根目录返回空字符串，找不到返回 404，用于确认双方指向同一文件夹。
-重名时保留两份，第二份命名为 `名字 (2).flac`；下载只连接公网地址。
-
-## 从旧版本升级
-
-在设置好 `MUSIC_DIR` 和 `OUT_DIR` 的终端中执行：
-
-```bash
-docker compose down
-docker compose up -d --build
-```
-
-第一条命令使用旧版本的 Compose 文件执行，清掉旧的 `analyzer`、`web` 两个容器，再换成新版文件启动。`data/` 和输出目录保持不动，缓存还在，未变化的歌曲不会重新分析。
-
-## 数据与增量规则
-
-- 支持扩展名 `flac mp3 m4a aac wav aiff ape ogg opus wma dsf`，不区分大小写，跳过隐藏目录。
-- 路径相对于音乐根目录。路径、大小、修改时间和分析器版本全部不变时，不再提取特征；已删除文件从缓存移除。
-- 单个文件分析失败时，只在缓存 `error` 列记录异常类名，不重试，也不进入输出。文件或分析器版本改变后才重新分析。
-- 每首歌取从总时长 30% 处开始的最多 60 秒；不足 60 秒时读取全曲。提取 53 维特征，再标准化、分组加权和 L2 归一化。
-- 标签缺失为 `null`，标题缺失使用不含扩展名的文件名。歌词优先使用同名 `.lrc`，其次使用内嵌歌词；没有歌词时语种为 `null`。
-- 输出 schema 为 1，时间为 UTC。向量和相似度保留 4 位小数，近邻用输出 `tracks` 数组下标表示，排除自身。
-- 输出先写临时 gzip 文件，再原子替换正式文件。
-
-## 本地验证
-
-```bash
-docker build -t xiyue-taste .
-docker run --rm -v "$PWD/tests:/app/tests:ro" xiyue-taste python -m pytest -q -p no:cacheprovider tests
-```
-
-解码依赖 ffmpeg，测试在镜像里跑。
-
-测试仅生成合成音频，不使用真实歌曲。
-
-读取输出曲目数：
-
-```bash
-python3 -c "import gzip,json;d=json.load(gzip.open('out/xiyue-taste-v1.json.gz'));print(len(d['tracks']))"
-```
-
-## 日志
-
-日志在面板右上角“日志”里查看和下载。
-日志文件保存在 `data/logs/`，最多约 3 MB，自动轮换。
-里面没有口令和密钥。
+接口、数据格式、增量扫描规则、测试方法见 [docs/开发说明.md](docs/开发说明.md)。
