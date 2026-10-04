@@ -499,7 +499,7 @@
     </form>
     <p class="ai-result" id="access-result" role="status" hidden></p>
     <p class="ai-note">口令保存后不会再显示。先把它复制到 App 的 设置 → AI 助手 → 访问口令，再点保存。</p>
-    <p class="ai-note">这个口令是你（主账户）的；家人用“家人账户”里的名字和密码登录。</p>
+    <p class="ai-note">这个口令是你（主账户）的，给旧版汐乐和脚本用；新版汐乐用“家人账户”里主账户的登录名和密码登录。</p>
     <p class="ai-note">在家不用口令；在外面要给 8790 端口做一个 https 外网地址，并在 App 里填上它和口令。</p>
   </aside>
   <aside class="drawer" id="logs-drawer" role="dialog" aria-modal="true" aria-labelledby="logs-title" aria-hidden="true">
@@ -560,7 +560,7 @@
   <aside class="drawer" id="accounts-drawer" role="dialog" aria-modal="true" aria-labelledby="accounts-title" aria-hidden="true">
     <button class="close" id="accounts-close" type="button" aria-label="关闭"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.8"><path d="m3.5 3.5 9 9m0-9-9 9" stroke-linecap="round"/></svg></button>
     <h2 class="d-title" id="accounts-title">家人账户</h2>
-    <p class="d-sub">家人用名字和密码在汐乐里登录</p>
+    <p class="d-sub">每个账号用名字和密码在汐乐里登录，同一时间只能一台设备在线</p>
     <div id="accounts-list"></div>
     <h3>新建</h3>
     <form id="accounts-form">
@@ -572,8 +572,8 @@
       </div>
     </form>
     <p class="ai-result" id="accounts-result" role="status" hidden></p>
-    <p class="ai-note">主账户就是你，不用建。家人在汐乐里填这台 NAS 的外网地址、名字和密码登录。</p>
-    <p class="ai-note">改密码会让这个人所有设备重新登录。家人的限额在“音源”里设置。</p>
+    <p class="ai-note">主账户就是你：先在上面设好登录名和密码，再在汐乐里登录。家人在汐乐里填这台 NAS 的外网地址、名字和密码登录。</p>
+    <p class="ai-note">在新设备登录后，旧设备会自动退出。改密码会让这个账号的设备重新登录。家人的限额在“音源”里设置。</p>
   </aside>
 
   <script>
@@ -1279,6 +1279,7 @@
     }
     function accountFailure(error) {
       return {
+        bad_request: "填写有误",
         bad_name: "名字要填 1–20 个字，不能含斜线或控制字符，也不能叫 owner 或主账户",
         bad_password: "密码要填 8–128 个可打印字符",
         name_taken: "这个名字已经用了",
@@ -1309,17 +1310,26 @@
       card.append(el("p", "ai-note", `最近同步 ${account.lastSyncAt ? new Date(account.lastSyncAt * 1000).toLocaleString("zh-CN") : "—"}`));
       const limits = account.limits;
       card.append(el("p", "ai-note", `今天 下载 ${account.today.download}${limits ? "/" + limits.downloadsPerDay : ""} · 播放 ${account.today.play}${limits ? "/" + limits.playsPerDay : ""} · AI ${account.today.ask}`));
-      if (account.owner) return card;
+      if (account.owner) card.append(el("p", "ai-note", account.loginName ? `登录名 ${account.loginName}` : "还没设登录名，汐乐里登录不了"));
       card.append(el("p", "ai-note", `设备 ${account.devices.length} 台`));
       const actions = el("div", "ai-actions");
-      const passwordButton = el("button", "scan quiet", "改密码");
-      const toggle = el("button", "scan quiet", account.enabled ? "停用" : "启用");
-      const remove = el("button", "scan quiet", "删除");
-      for (const button of [passwordButton, toggle, remove]) button.type = "button";
-      actions.append(passwordButton, toggle, remove);
+      const passwordButton = el("button", "scan quiet", account.owner ? (account.loginName ? "改登录名和密码" : "设置登录名和密码") : "改密码");
+      passwordButton.type = "button";
+      actions.append(passwordButton);
       card.append(actions);
       const form = el("form");
       form.hidden = true;
+      const loginName = el("input");
+      if (account.owner) {
+        const nameLabel = el("label", "field");
+        loginName.type = "text";
+        loginName.autocomplete = "off";
+        loginName.maxLength = 20;
+        loginName.required = true;
+        loginName.value = account.loginName || "";
+        nameLabel.append(el("span", "", "登录名"), loginName);
+        form.append(nameLabel);
+      }
       const label = el("label", "field");
       const password = el("input");
       password.type = "text";
@@ -1331,6 +1341,12 @@
       const saveActions = el("div", "ai-actions");
       const save = el("button", "scan", "保存");
       save.type = "submit";
+      if (account.owner) {
+        const generate = el("button", "scan quiet", "生成一个");
+        generate.type = "button";
+        generate.addEventListener("click", () => { password.value = generatedAccountPassword(); });
+        saveActions.append(generate);
+      }
       saveActions.append(save);
       form.append(label, saveActions);
       card.append(form);
@@ -1338,21 +1354,29 @@
       form.addEventListener("submit", async event => {
         event.preventDefault();
         save.disabled = true;
-        await changeAccount(`/api/accounts/${account.id}`, "POST", { password: password.value }, "已改，这个人的设备都要重新登录");
+        const body = { password: password.value };
+        if (account.owner) body.name = loginName.value;
+        await changeAccount(`/api/accounts/${account.id}`, "POST", body, account.owner ? "已保存，你的设备要用新密码重新登录" : "已改，这个人的设备都要重新登录");
         password.value = "";
         save.disabled = false;
       });
-      toggle.addEventListener("click", async () => {
-        toggle.disabled = true;
-        await changeAccount(`/api/accounts/${account.id}`, "POST", { enabled: !account.enabled }, account.enabled ? "已停用" : "已启用");
-        toggle.disabled = false;
-      });
-      remove.addEventListener("click", async () => {
-        if (!confirm("删除后，这个人的收听记录、喜欢和歌单都会从 NAS 上删掉，不能恢复。")) return;
-        remove.disabled = true;
-        await changeAccount(`/api/accounts/${account.id}`, "DELETE", undefined, "已删除");
-        remove.disabled = false;
-      });
+      if (!account.owner) {
+        const toggle = el("button", "scan quiet", account.enabled ? "停用" : "启用");
+        const remove = el("button", "scan quiet", "删除");
+        toggle.type = remove.type = "button";
+        actions.append(toggle, remove);
+        toggle.addEventListener("click", async () => {
+          toggle.disabled = true;
+          await changeAccount(`/api/accounts/${account.id}`, "POST", { enabled: !account.enabled }, account.enabled ? "已停用" : "已启用");
+          toggle.disabled = false;
+        });
+        remove.addEventListener("click", async () => {
+          if (!confirm("删除后，这个人的收听记录、喜欢和歌单都会从 NAS 上删掉，不能恢复。")) return;
+          remove.disabled = true;
+          await changeAccount(`/api/accounts/${account.id}`, "DELETE", undefined, "已删除");
+          remove.disabled = false;
+        });
+      }
       const devices = el("details");
       devices.append(el("summary", "", "设备列表"));
       const list = el("ul", "dl");
@@ -1411,10 +1435,13 @@
     }
     $("accounts-open").addEventListener("click", openAccounts);
     $("accounts-close").addEventListener("click", closeAccounts);
-    $("accounts-generate").addEventListener("click", () => {
+    function generatedAccountPassword() {
       const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
       const bytes = crypto.getRandomValues(new Uint8Array(12));
-      $("accounts-password").value = Array.from(bytes, byte => alphabet[byte % alphabet.length]).join("");
+      return Array.from(bytes, byte => alphabet[byte % alphabet.length]).join("");
+    }
+    $("accounts-generate").addEventListener("click", () => {
+      $("accounts-password").value = generatedAccountPassword();
     });
     $("accounts-form").addEventListener("submit", async event => {
       event.preventDefault();

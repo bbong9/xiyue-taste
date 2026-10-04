@@ -1,4 +1,4 @@
-"""Family accounts and hashed device credentials; the owner's access settings stay separate."""
+"""Owner login names, family accounts and hashed device credentials; access settings stay separate."""
 
 import collections
 import hashlib
@@ -60,13 +60,14 @@ def _valid_index(saved):
     if not isinstance(saved, dict) or not isinstance(saved.get("accounts"), list) or not isinstance(saved.get("devices"), list):
         return False
     ids, names, devices, tokens = set(), set(), set(), set()
-    if len(saved["accounts"]) > 20:
+    if len(saved["accounts"]) > 21:
         return False
     try:
         for row in saved["accounts"]:
             password = row["password"]
             if (
-                not ACCOUNT_ID.fullmatch(row["id"]) or row["id"] in ids
+                (row["id"] != "owner" and not ACCOUNT_ID.fullmatch(row["id"])) or row["id"] in ids
+                or (row["id"] == "owner" and row["enabled"] is not True)
                 or _name(row["name"]) != row["name"] or row["name"].casefold() in names
                 or type(row["enabled"]) is not bool or type(row["createdAt"]) is not int
                 or type(row["failures"]) is not int or row["failures"] < 0
@@ -77,6 +78,8 @@ def _valid_index(saved):
                 return False
             ids.add(row["id"])
             names.add(row["name"].casefold())
+        if len(ids - {"owner"}) > 20:
+            return False
         counts = collections.Counter()
         for row in saved["devices"]:
             if (
@@ -101,6 +104,7 @@ class AccountStore:
         self._clock = clock
         self._lock = threading.Lock()
         self._failures = collections.deque()
+        self._replaced = collections.OrderedDict()
         self._last_save = clock()
         self._accounts, self._devices = [], []
         try:
@@ -136,7 +140,7 @@ class AccountStore:
         with self._lock:
             if any(row["name"].casefold() == name.casefold() for row in self._accounts):
                 raise AccountError("name_taken", 409)
-            if len(self._accounts) >= 20:
+            if sum(row["id"] != "owner" for row in self._accounts) >= 20:
                 raise AccountError("too_many_accounts", 409)
             row = {
                 "id": secrets.token_hex(8), "name": name, "enabled": True, "createdAt": int(self._clock()),
@@ -146,6 +150,20 @@ class AccountStore:
             self._save()
         LOGGER.info("ACCOUNT-CHANGE action=create account=%s", row["id"])
         return {"id": row["id"], "name": row["name"]}
+
+    def set_owner_login(self, name, password):
+        name, password = _name(name), _password(password)
+        with self._lock:
+            if any(row["id"] != "owner" and row["name"].casefold() == name.casefold() for row in self._accounts):
+                raise AccountError("name_taken", 409)
+            row = next((row for row in self._accounts if row["id"] == "owner"), None)
+            if row is None:
+                row = {"id": "owner", "enabled": True, "createdAt": int(self._clock())}
+                self._accounts.append(row)
+            row.update(name=name, password=_password_record(password), failures=0, lockedUntil=None)
+            self._devices = [device for device in self._devices if device["account"] != "owner"]
+            self._save()
+        LOGGER.info("ACCOUNT-CHANGE action=owner-login account=owner")
 
     def login(self, name, password, device_name=None):
         with self._lock:
@@ -191,13 +209,14 @@ class AccountStore:
                         "createdAt": now, "lastSeenAt": now,
                     }
                     own = [item for item in self._devices if item["account"] == account_id]
-                    if len(own) == 10:
-                        oldest = min(own, key=lambda item: item["lastSeenAt"])
-                        self._devices.remove(oldest)
-                        LOGGER.info("ACCOUNT-DEVICE dropped account=%s device=%s", account_id, oldest["id"])
+                    for old in own:
+                        self._replaced[old["tokenHash"]] = account_id
+                    while len(self._replaced) > 200:
+                        self._replaced.popitem(last=False)
+                    self._devices = [item for item in self._devices if item["account"] != account_id]
                     self._devices.append(device)
                     self._save()
-                    LOGGER.info("ACCOUNT-LOGIN ok account=%s device=%s", account_id, device["id"])
+                    LOGGER.info("ACCOUNT-LOGIN ok account=%s device=%s replaced=%s", account_id, device["id"], len(own))
                     return {"token": token, "account": {"id": account_id, "name": row["name"]}}
             LOGGER.info("ACCOUNT-LOGIN fail reason=%s account=%s", reason, account_id)
             raise AccountError(code, status)
@@ -206,6 +225,9 @@ class AccountStore:
         with self._lock:
             device = self._device(token)
             if device is None:
+                account_id = self._replaced.get(hashlib.sha256(token.encode("utf-8")).hexdigest())
+                if account_id is not None:
+                    return "replaced", account_id
                 return "unknown", None
             row = self._find(device["account"])
             device["lastSeenAt"] = int(self._clock())
@@ -232,7 +254,7 @@ class AccountStore:
         LOGGER.info("ACCOUNT-CHANGE action=password account=%s", account_id)
 
     def set_enabled(self, account_id, enabled):
-        if type(enabled) is not bool:
+        if account_id == "owner" or type(enabled) is not bool:
             raise AccountError("bad_request")
         with self._lock:
             self._find(account_id)["enabled"] = enabled
@@ -240,9 +262,13 @@ class AccountStore:
         LOGGER.info("ACCOUNT-CHANGE action=%s account=%s", "enable" if enabled else "disable", account_id)
 
     def delete(self, account_id):
+        if account_id == "owner":
+            raise AccountError("bad_request")
         with self._lock:
             self._accounts.remove(self._find(account_id))
             self._devices = [device for device in self._devices if device["account"] != account_id]
+            for hashed in [key for key, value in self._replaced.items() if value == account_id]:
+                del self._replaced[hashed]
             self._save()
         LOGGER.info("ACCOUNT-CHANGE action=delete account=%s", account_id)
 
@@ -270,4 +296,18 @@ class AccountStore:
                     {key: device[key] for key in ("id", "name", "createdAt", "lastSeenAt")}
                     for device in self._devices if device["account"] == row["id"]
                 ],
-            } for row in self._accounts]
+            } for row in self._accounts if row["id"] != "owner"]
+
+    def owner_login_name(self):
+        with self._lock:
+            return next((row["name"] for row in self._accounts if row["id"] == "owner"), None)
+
+    def owner_panel(self):
+        with self._lock:
+            return {
+                "loginName": next((row["name"] for row in self._accounts if row["id"] == "owner"), None),
+                "devices": [
+                    {key: device[key] for key in ("id", "name", "createdAt", "lastSeenAt")}
+                    for device in self._devices if device["account"] == "owner"
+                ],
+            }

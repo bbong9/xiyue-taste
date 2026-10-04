@@ -22,7 +22,7 @@ from .sources import SourceError
 
 
 _SOURCE_ITEM = re.compile(r"/api/sources/([0-9a-f]{16})(/test|/replace|/refresh|/rollback)?")
-_ACCOUNT_ITEM = re.compile(r"/api/accounts/([0-9a-f]{16})(?:/devices/([0-9a-f]{16}))?")
+_ACCOUNT_ITEM = re.compile(r"/api/accounts/(owner|[0-9a-f]{16})(?:/devices/([0-9a-f]{16}))?")
 _DISABLED = object()
 _STREAM_PREFIX = "/api/source/stream/"
 _auth_rejections = {}
@@ -107,6 +107,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     def _reject_auth(self):
         if self._account() is _DISABLED:
             self._send_json({"error": "account_disabled"}, 403)
+        elif self._identity[0] == "replaced":
+            self._send_json({"error": "signed_in_elsewhere"}, 401)
         else:
             self._send_json({"error": "unauthorized"}, 401)
 
@@ -159,7 +161,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             else:
                 self._identity = ("unknown", None)
         state, account = self._identity
-        return _DISABLED if state == "disabled" else account
+        if state == "disabled":
+            return _DISABLED
+        return account if state == "ok" else None
 
     def _owner_only(self):
         if self._account() == OWNER:
@@ -187,7 +191,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         limits = self._resolver.ledger.limits() if self._resolver is not None else FAMILY_DEFAULTS
         today = self._resolver.ledger.recent(1)[0]["accounts"].get(account, {}) if self._resolver is not None else {}
         return {
-            "account": {"id": account, "name": self._accounts.name_of(account), "owner": account == OWNER},
+            "account": {
+                "id": account, "name": (self._accounts.owner_login_name() or "主账户") if account == OWNER else self._accounts.name_of(account),
+                "owner": account == OWNER,
+            },
             "limits": None if account == OWNER else {
                 "downloadsPerDay": limits["familyDownloadsPerDay"], "playsPerDay": limits["familyPlaysPerDay"],
             },
@@ -208,7 +215,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         elif url.path == "/api/me/collections":
             self._send_json(self._personal.collections(account))
         elif url.path == "/api/accounts" and self._home_only():
-            rows = [{"id": OWNER, "name": "主账户（我）", "owner": True, "devices": []}, *self._accounts.panel_rows()]
+            rows = [{"id": OWNER, "name": "主账户（我）", "owner": True, **self._accounts.owner_panel()}, *self._accounts.panel_rows()]
             for row in rows:
                 info = self._account_info(row["id"])
                 row.update(owner=row["id"] == OWNER, limits=info["limits"], today=info["today"])
@@ -224,7 +231,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 if body is not None:
                     self._send_json(self._accounts.login(body.get("name"), body.get("password"), body.get("device")))
             elif path == "/api/account/logout":
-                if self._account() == OWNER:
+                if not self.headers.get("Authorization", "").startswith("Bearer xyd_"):
                     self._send_json({"error": "not_a_device"}, 400)
                 else:
                     self._accounts.logout(self.headers["Authorization"][7:])
@@ -248,6 +255,11 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     self._send_json(self._accounts.create(body.get("name"), body.get("password")))
                 elif item.group(2) is not None:
                     self._send_json({"error": "not_found"}, 404)
+                elif item.group(1) == OWNER:
+                    if "enabled" in body or "name" not in body or "password" not in body:
+                        raise AccountError("bad_request")
+                    self._accounts.set_owner_login(body["name"], body["password"])
+                    self._send_json({"ok": True})
                 else:
                     if "enabled" in body and type(body["enabled"]) is not bool:
                         raise AccountError("bad_request")

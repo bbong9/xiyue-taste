@@ -141,43 +141,34 @@ def test_accounts_disabled_then_enabled_and_password_kicks_devices(tmp_path, mon
     monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
     accounts, personal = AccountStore(tmp_path), PersonalStore(tmp_path)
     account, token = _family(accounts)
-    second = accounts.login("家人", PASSWORD)["token"]
     with _server(tmp_path, accounts, personal) as port:
         _request(port, "POST", f"/api/accounts/{account}", {"enabled": False})
         assert _request(port, "POST", "/api/account/login", {"name": "家人", "password": PASSWORD}, status=403) == {
             "error": "account_disabled",
         }
         assert _request(port, "GET", "/api/stats", token=token, status=403) == {"error": "account_disabled"}
-        assert len(accounts.panel_rows()[0]["devices"]) == 2
+        assert len(accounts.panel_rows()[0]["devices"]) == 1
         _request(port, "POST", f"/api/accounts/{account}", {"enabled": True})
         _request(port, "GET", "/api/stats", token=token)
         _request(port, "POST", f"/api/accounts/{account}", {"password": "Another-family-password"})
-        for old in (token, second):
+        for old in (token,):
             assert _request(port, "GET", "/api/stats", token=old, status=401) == {"error": "unauthorized"}
         assert accounts.panel_rows()[0]["devices"] == []
 
 
-def test_accounts_evict_least_recent_device_and_throttle_last_seen_writes(tmp_path):
+def test_accounts_throttle_last_seen_writes(tmp_path):
     clock = _Clock()
     store = AccountStore(tmp_path, clock)
     account = store.create("家人", PASSWORD)["id"]
-    tokens = []
-    for number in range(10):
-        tokens.append(store.login("家人", PASSWORD, f"设备{number}")["token"])
-        clock.advance(1)
+    token = store.login("家人", PASSWORD, "设备")["token"]
+    clock.advance(1)
     path = tmp_path / "accounts.json"
     before = path.read_bytes()
-    assert store.lookup(tokens[0]) == ("ok", account)
+    assert store.lookup(token) == ("ok", account)
     assert path.read_bytes() == before
     clock.advance(600)
-    store.lookup(tokens[0])
+    store.lookup(token)
     assert path.read_bytes() != before
-    newest = store.login("家人", PASSWORD, "\n")["token"]
-    assert store.lookup(tokens[1]) == ("unknown", None)
-    assert store.lookup(tokens[0]) == ("ok", account)
-    assert store.lookup(newest) == ("ok", account)
-    devices = store.panel_rows()[0]["devices"]
-    assert len(devices) == 10 and devices[-1]["name"] == "未命名设备"
 
 
 def test_accounts_delete_clears_personal_directory_devices_and_indexes(tmp_path, monkeypatch):
@@ -283,8 +274,9 @@ def test_accounts_login_logout_revoke_and_panel_summary(tmp_path, monkeypatch):
         _request(port, "POST", "/api/account/logout", token=token)
         _request(port, "GET", "/api/account/me", token=token, status=401)
         assert _request(port, "POST", "/api/account/logout", status=400) == {"error": "not_a_device"}
-        for path in ("/api/accounts/../../", "/api/accounts/owner", "/api/accounts/" + "a" * 17):
+        for path in ("/api/accounts/../../", "/api/accounts/" + "a" * 17):
             _request(port, "DELETE", path, status=404)
+        assert _request(port, "DELETE", "/api/accounts/owner", status=400) == {"error": "bad_request"}
 
 
 def test_personal_listening_deduplicates_pages_and_preserves_opaque_events(tmp_path):
@@ -552,3 +544,120 @@ def test_accounts_validation_limits_and_bad_index_preserves_original(tmp_path, c
     assert "ACCOUNT-INDEX unreadable" in caplog.text
     reopened.create("新家人", PASSWORD)
     assert json.loads(path.read_text())["accounts"][0]["name"] == "新家人"
+
+
+def test_owner_login_name_permissions_devices_and_password(tmp_path, monkeypatch):
+    accounts, personal = AccountStore(tmp_path), PersonalStore(tmp_path)
+    with _server(tmp_path, accounts, personal) as port:
+        monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
+        assert _request(port, "GET", "/api/accounts")["accounts"][0]["loginName"] is None
+        _request(port, "POST", "/api/accounts/owner", {"name": "我的账号", "password": PASSWORD})
+        assert accounts.owner_login_name() == "我的账号"
+        assert accounts.panel_rows() == []
+        monkeypatch.setattr(_Handler, "_is_trusted", lambda self: False)
+        token = _request(port, "POST", "/api/account/login", {
+            "name": "我的账号", "password": PASSWORD, "device": "主人手机",
+        }, outside=True)["token"]
+        me = _request(port, "GET", "/api/account/me", token=token, outside=True)
+        assert me["account"] == {"id": OWNER, "name": "我的账号", "owner": True}
+        assert me["limits"] is None
+        _request(port, "GET", "/api/logs", token=token, outside=True)
+        monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
+        owner = _request(port, "GET", "/api/accounts")["accounts"][0]
+        assert owner["name"] == "主账户（我）" and owner["loginName"] == "我的账号"
+        assert len(owner["devices"]) == 1 and owner["devices"][0]["name"] == "主人手机"
+        assert _request(port, "POST", "/api/accounts", {"name": "我的账号", "password": PASSWORD}, status=409) == {"error": "name_taken"}
+        _request(port, "POST", "/api/accounts", {"name": "家人", "password": PASSWORD})
+        assert _request(port, "POST", "/api/accounts/owner", {"name": "家人", "password": PASSWORD}, status=409) == {"error": "name_taken"}
+        for body in ({"enabled": False}, {"name": "我的账号"}, {"password": PASSWORD}):
+            assert _request(port, "POST", "/api/accounts/owner", body, status=400) == {"error": "bad_request"}
+        assert _request(port, "DELETE", "/api/accounts/owner", status=400) == {"error": "bad_request"}
+        _request(port, "POST", "/api/accounts/owner", {"name": "新的登录名", "password": "New-owner-password"})
+        assert _request(port, "GET", "/api/account/me", token=token, status=401) == {"error": "unauthorized"}
+        assert accounts.owner_panel() == {"loginName": "新的登录名", "devices": []}
+        assert accounts.name_of(OWNER) == "主账户"
+
+
+@pytest.mark.parametrize("owner", [False, True])
+def test_account_new_login_replaces_previous_device(tmp_path, monkeypatch, caplog, owner):
+    caplog.set_level(logging.INFO, logger="xiyue")
+    monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
+    accounts, personal = AccountStore(tmp_path), PersonalStore(tmp_path)
+    if owner:
+        accounts.set_owner_login("账号", PASSWORD)
+        account = OWNER
+    else:
+        account = accounts.create("账号", PASSWORD)["id"]
+    with _server(tmp_path, accounts, personal) as port:
+        a = _request(port, "POST", "/api/account/login", {"name": "账号", "password": PASSWORD, "device": "A"})["token"]
+        b = _request(port, "POST", "/api/account/login", {"name": "账号", "password": PASSWORD, "device": "B"})["token"]
+        assert _request(port, "GET", "/api/account/me", token=a, status=401) == {"error": "signed_in_elsewhere"}
+        assert _request(port, "GET", "/api/account/me", token=b)["account"]["id"] == account
+        rows = _request(port, "GET", "/api/accounts")["accounts"]
+        devices = next(row for row in rows if row["id"] == account)["devices"]
+        assert len(devices) == 1 and devices[0]["name"] == "B"
+    assert accounts.lookup(a) == ("replaced", account)
+    assert AccountStore(tmp_path).lookup(a) == ("unknown", None)
+    assert AccountStore(tmp_path).lookup(b) == ("ok", account)
+    assert "replaced=1" in caplog.text and a not in caplog.text and b not in caplog.text
+
+
+def test_owner_device_logout_and_revoke_are_not_replacements(tmp_path, monkeypatch):
+    monkeypatch.setattr(_Handler, "_is_trusted", lambda self: True)
+    accounts, personal = AccountStore(tmp_path), PersonalStore(tmp_path)
+    accounts.set_owner_login("我的账号", PASSWORD)
+    with _server(tmp_path, accounts, personal) as port:
+        token = accounts.login("我的账号", PASSWORD)["token"]
+        assert _request(port, "POST", "/api/account/logout", token=token) == {"ok": True}
+        assert _request(port, "GET", "/api/account/me", token=token, status=401) == {"error": "unauthorized"}
+        token = accounts.login("我的账号", PASSWORD)["token"]
+        device = accounts.owner_panel()["devices"][0]["id"]
+        _request(port, "DELETE", f"/api/accounts/owner/devices/{device}")
+        assert _request(port, "GET", "/api/account/me", token=token, status=401) == {"error": "unauthorized"}
+
+
+def test_owner_record_does_not_use_a_family_slot_and_legacy_devices_still_load(tmp_path):
+    accounts = AccountStore(tmp_path)
+    accounts.set_owner_login("我的账号", PASSWORD)
+    token = accounts.login("我的账号", PASSWORD)["token"]
+    for number in range(20):
+        accounts.create(f"家人{number}", PASSWORD)
+    path = tmp_path / "accounts.json"
+    saved = json.loads(path.read_text())
+    # Existing card-47 indexes may contain up to ten devices for an account.
+    device = saved["devices"][0]
+    saved["devices"].extend({
+        **device, "id": f"{number:016x}", "tokenHash": hashlib.sha256(f"legacy-{number}".encode()).hexdigest(),
+    } for number in range(1, 10))
+    path.write_text(json.dumps(saved))
+    reopened = AccountStore(tmp_path)
+    assert len(reopened.panel_rows()) == 20
+    assert len(reopened.owner_panel()["devices"]) == 10
+    assert reopened.lookup(token) == ("ok", OWNER)
+    with pytest.raises(AccountError) as error:
+        reopened.create("超额", PASSWORD)
+    assert (error.value.code, error.value.status) == ("too_many_accounts", 409)
+    reopened.login("我的账号", PASSWORD)
+    assert len(reopened.owner_panel()["devices"]) == 1
+    assert reopened.lookup(token) == ("replaced", OWNER)
+    with pytest.raises(AccountError, match="bad_request"):
+        reopened.set_enabled(OWNER, False)
+    with pytest.raises(AccountError, match="bad_request"):
+        reopened.delete(OWNER)
+
+
+def test_replacement_memory_is_bounded_and_deleted_with_account(tmp_path):
+    accounts = AccountStore(tmp_path)
+    account = accounts.create("家人", PASSWORD)["id"]
+    # Seed a full in-memory table, then exercise the real replacement and eviction.
+    for number in range(200):
+        accounts._replaced[hashlib.sha256(f"old-{number}".encode()).hexdigest()] = account
+    token = accounts.login("家人", PASSWORD)["token"]
+    accounts.login("家人", PASSWORD)
+    assert len(accounts._replaced) == 200
+    assert accounts.lookup("old-0") == ("unknown", None)
+    assert accounts.lookup("old-1") == ("replaced", account)
+    assert accounts.lookup(token) == ("replaced", account)
+    accounts.delete(account)
+    assert accounts._replaced == {}
+    assert accounts.lookup(token) == ("unknown", None)
