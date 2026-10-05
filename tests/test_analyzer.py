@@ -949,6 +949,74 @@ def _wait_for(downloads, job_id):
     raise AssertionError("download did not finish")
 
 
+def test_download_on_done_runs_once_after_finish_outside_lock(tmp_path, monkeypatch):
+    called = threading.Event()
+    snapshots = []
+
+    def on_done():
+        snapshots.append(downloads.snapshot())
+        called.set()
+
+    downloads = Downloads(tmp_path, on_done=on_done)
+    monkeypatch.setattr(downloads, "_fetch", lambda job: "song.flac")
+    job_id = downloads.submit({"url": "https://audio.example/song", "filename": "song.flac"})
+    assert called.wait(3), "on_done must run outside the lock so it can read the completed job"
+    assert len(snapshots) == 1
+    assert snapshots[0][0]["id"] == job_id
+    assert snapshots[0][0]["state"] == "done"
+    assert snapshots[0][0]["finishedAt"] is not None
+    assert _wait_for(downloads, job_id)["state"] == "done"
+
+
+@pytest.mark.parametrize("reason,state", [("not_audio", "failed"), ("cancelled", "cancelled")])
+def test_download_on_done_skips_failed_and_cancelled(tmp_path, monkeypatch, reason, state):
+    finished = threading.Event()
+    callbacks = []
+
+    def on_done():
+        snapshot = downloads.snapshot()
+        callbacks.append([job["state"] for job in snapshot])
+        if len(snapshot) == 2 and all(job["finishedAt"] is not None for job in snapshot):
+            finished.set()
+
+    def fetch(job):
+        if job["filename"] == "bad.flac":
+            raise DownloadError(reason)
+        return "good.flac"
+
+    downloads = Downloads(tmp_path, on_done=on_done)
+    monkeypatch.setattr(downloads, "_fetch", fetch)
+    bad = downloads.submit({"url": "https://audio.example/bad", "filename": "bad.flac"})
+    good = downloads.submit({"url": "https://audio.example/good", "filename": "good.flac"})
+    assert finished.wait(3)
+    assert _wait_for(downloads, bad)["state"] == state
+    assert _wait_for(downloads, good)["state"] == "done"
+    assert callbacks == [["done", state]]
+
+
+def test_download_on_done_failure_keeps_job_done_and_worker_running(tmp_path, monkeypatch, caplog):
+    finished = threading.Event()
+    calls = []
+
+    def on_done():
+        calls.append(downloads.snapshot())
+        if len(calls) == 1:
+            raise RuntimeError("private/path/song.flac")
+        finished.set()
+
+    downloads = Downloads(tmp_path, on_done=on_done)
+    monkeypatch.setattr(downloads, "_fetch", lambda job: job["filename"])
+    first = downloads.submit({"url": "https://audio.example/one", "filename": "one.flac"})
+    second = downloads.submit({"url": "https://audio.example/two", "filename": "two.flac"})
+    assert finished.wait(3)
+    assert len(calls) == 2
+    assert _wait_for(downloads, first)["state"] == "done"
+    assert _wait_for(downloads, second)["state"] == "done"
+    messages = [record.getMessage() for record in caplog.records if "LOUD-AFTER-DOWNLOAD" in record.message]
+    assert messages == ["LOUD-AFTER-DOWNLOAD failed"]
+    assert "private/path" not in caplog.text
+
+
 def test_download_saves_the_song_with_lyrics_and_cover_next_to_it(tmp_path, monkeypatch):
     def missing_ffmpeg(path):
         raise loudness.LoudnessError("ffmpeg_missing")

@@ -33,6 +33,7 @@ from .scan import AUDIO_EXTENSIONS
 
 
 WRITABLE = {"flac", "mp3", "m4a"}
+_MEASURE_RETRY_SECONDS = 30
 TAG_NAMES = {
     "track_gain": "REPLAYGAIN_TRACK_GAIN", "track_peak": "REPLAYGAIN_TRACK_PEAK",
     "album_gain": "REPLAYGAIN_ALBUM_GAIN", "album_peak": "REPLAYGAIN_ALBUM_PEAK",
@@ -559,6 +560,40 @@ class Loudness:
 
     def __init__(self, library, data, out, music):
         self.library, self.data, self.out, self.music = library, data, out, music
+        self._measure_request_lock = threading.Lock()
+        self._measure_retry = None
+
+    def request_measure(self):
+        """Incrementally measure after a download, coalescing retries while busy."""
+        with self._measure_request_lock:
+            if self._measure_retry is None:
+                self._request_measure(20)
+
+    def _request_measure(self, retries_left):
+        try:
+            self.start("measuring", remeasure=False)
+        except LoudnessError as error:
+            if error.code != "busy":
+                raise
+            if retries_left == 0:
+                LOGGER.warning("LOUD-AFTER-DOWNLOAD gave_up")
+                return
+            LOGGER.info("LOUD-AFTER-DOWNLOAD busy_retry")
+            self._measure_retry = threading.Timer(
+                _MEASURE_RETRY_SECONDS, self._retry_measure, args=(retries_left - 1,),
+            )
+            self._measure_retry.daemon = True
+            self._measure_retry.start()
+        else:
+            LOGGER.info("LOUD-AFTER-DOWNLOAD started")
+
+    def _retry_measure(self, retries_left):
+        with self._measure_request_lock:
+            self._measure_retry = None
+            try:
+                self._request_measure(retries_left)
+            except Exception:
+                LOGGER.warning("LOUD-AFTER-DOWNLOAD failed")
 
     def snapshot(self):
         state = _read_state(self.data)

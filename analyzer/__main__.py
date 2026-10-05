@@ -167,11 +167,12 @@ def main():
         runner.on_ready = sources.reload_all
         runner.on_alert = sources.note_alert
         threading.Thread(target=_run_sources, args=(runner, sources), name="sources", daemon=True).start()
+        loudness_service = loudness.Loudness(args.downloads, args.data, args.out, args.music)
         server = make_server(
             args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler, llm=llm,
-            downloads=Downloads(args.downloads),
+            downloads=Downloads(args.downloads, on_done=loudness_service.request_measure),
             access=access, sources=sources, resolver=resolver, accounts=accounts, personal=personal,
-            loudness=loudness.Loudness(args.downloads, args.data, args.out, args.music),
+            loudness=loudness_service,
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
         LOGGER.info("Serving on port %s.", args.port)

@@ -487,6 +487,98 @@ def _idle(service):
     raise AssertionError("loudness job did not finish")
 
 
+def test_request_measure_starts_incrementally_and_exports_new_track(folders, monkeypatch, caplog):
+    library, data, out = folders
+    _flac(library / "old.flac", tags={"REPLAYGAIN_TRACK_GAIN": "-1 dB"})
+    calls = _ffmpeg(monkeypatch)
+    loudness.measure(library, data, out)
+    _flac(library / "new.flac", tags={"REPLAYGAIN_TRACK_GAIN": "-2 dB"})
+    service = loudness.Loudness(library, data, out, library)
+    caplog.set_level(logging.INFO, logger="xiyue")
+    service.request_measure()
+    status = _idle(service)
+    assert status["lastMeasure"]["fromTags"] == 1
+    assert status["lastMeasure"]["measured"] == 0
+    assert calls == []
+    tracks = _exported(out)["tracks"]
+    assert [track["path"] for track in tracks] == ["new.flac", "old.flac"]
+    assert tracks[0]["trackGain"] == -2
+    assert tracks[0]["source"] == "tag"
+    messages = [record.getMessage() for record in caplog.records if "LOUD-AFTER-DOWNLOAD" in record.message]
+    assert messages == ["LOUD-AFTER-DOWNLOAD started"]
+
+
+def test_request_measure_coalesces_busy_requests(folders, monkeypatch, caplog):
+    library, data, out = folders
+    _flac(library / "new.flac", tags={"REPLAYGAIN_TRACK_GAIN": "-2 dB"})
+    service = loudness.Loudness(library, data, out, library)
+    entered, release, started = threading.Event(), threading.Event(), threading.Event()
+    retry, start = service._retry_measure, service.start
+
+    def gated_retry(retries_left):
+        entered.set()
+        assert release.wait(3)
+        retry(retries_left)
+
+    def observed_start(operation, **options):
+        assert operation == "measuring" and options == {"remeasure": False}
+        start(operation, **options)
+        started.set()
+
+    monkeypatch.setattr(loudness, "_MEASURE_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(service, "_retry_measure", gated_retry)
+    monkeypatch.setattr(service, "start", observed_start)
+    caplog.set_level(logging.INFO, logger="xiyue")
+    try:
+        with loudness._acquire(data):
+            service.request_measure()
+            timer = service._measure_retry
+            service.request_measure()
+            service.request_measure()
+            assert service._measure_retry is timer
+            assert entered.wait(3)
+            assert not started.is_set()
+        release.set()
+        assert started.wait(3)
+        timer.join(3)
+        assert not timer.is_alive()
+        assert service._measure_retry is None
+        assert _idle(service)["lastMeasure"]["fromTags"] == 1
+        assert [track["path"] for track in _exported(out)["tracks"]] == ["new.flac"]
+        messages = [record.getMessage() for record in caplog.records if "LOUD-AFTER-DOWNLOAD" in record.message]
+        assert messages == ["LOUD-AFTER-DOWNLOAD busy_retry", "LOUD-AFTER-DOWNLOAD started"]
+    finally:
+        release.set()
+
+
+def test_request_measure_gives_up_after_twenty_retries(folders, monkeypatch, caplog):
+    library, data, out = folders
+    service = loudness.Loudness(library, data, out, library)
+    pending = []
+
+    class Timer:
+        def __init__(self, seconds, function, args):
+            assert seconds == 30
+            self.function, self.args = function, args
+
+        def start(self):
+            pending.append(self)
+
+    monkeypatch.setattr(loudness.threading, "Timer", Timer)
+    caplog.set_level(logging.INFO, logger="xiyue")
+    with loudness._acquire(data):
+        service.request_measure()
+        for _ in range(20):
+            assert len(pending) == 1
+            timer = pending.pop()
+            assert timer.daemon is True
+            timer.function(*timer.args)
+        assert pending == []
+        assert service._measure_retry is None
+    messages = [record.getMessage() for record in caplog.records if "LOUD-AFTER-DOWNLOAD" in record.message]
+    assert messages == ["LOUD-AFTER-DOWNLOAD busy_retry"] * 20 + ["LOUD-AFTER-DOWNLOAD gave_up"]
+
+
 def test_http_owner_permissions_busy_bad_paths_and_counts(folders, monkeypatch):
     library, data, out = folders
     _flac(library / "a.flac")

@@ -181,9 +181,10 @@ class Downloads:
     """Songs the phone asks this NAS to fetch itself: one at a time, into the
     downloads folder and nowhere else. Addresses are used, never listed."""
 
-    def __init__(self, root, allow_private=False):
+    def __init__(self, root, allow_private=False, on_done=None):
         self._root = Path(root)
         self._check = _check_shape if allow_private else check_public
+        self._on_done = on_done
         self._lock = threading.Lock()
         self._wake = threading.Condition(self._lock)
         self._jobs = {}
@@ -322,6 +323,11 @@ class Downloads:
                 error = "io_failed"
             with self._lock:
                 self._finish(job, state, error, path)
+            if state == "done" and self._on_done is not None:
+                try:
+                    self._on_done()
+                except Exception:
+                    LOGGER.warning("LOUD-AFTER-DOWNLOAD failed")
 
     def _own(self, path, folder=False):
         try:
