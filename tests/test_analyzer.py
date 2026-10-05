@@ -23,6 +23,7 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analyzer import ANALYZER_VERSION
+from analyzer import loudness
 from analyzer.access import AccessError, AccessSettings
 from analyzer.ask import Asker, AskError
 from analyzer.features import extract_features
@@ -945,7 +946,11 @@ def _wait_for(downloads, job_id):
     raise AssertionError("download did not finish")
 
 
-def test_download_saves_the_song_with_lyrics_and_cover_next_to_it(tmp_path):
+def test_download_saves_the_song_with_lyrics_and_cover_next_to_it(tmp_path, monkeypatch):
+    def missing_ffmpeg(path):
+        raise loudness.LoudnessError("ffmpeg_missing")
+
+    monkeypatch.setattr(loudness, "measure_audio", missing_ffmpeg)
     server, base = _file_server({"/a": (200, _AUDIO)})
     try:
         downloads = Downloads(tmp_path, allow_private=True)

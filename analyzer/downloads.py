@@ -24,6 +24,7 @@ from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 from mutagen.wave import WAVE
 
+from . import loudness
 from .log import LOGGER
 
 AUDIO_EXTENSIONS = ("flac", "mp3", "m4a", "aac", "ogg", "opus", "wav", "ape")
@@ -356,6 +357,12 @@ class Downloads:
             facts = _facts(part)
             if facts["durationMs"] < job["minDurationMs"]:
                 raise DownloadError("too_short")
+            if facts["format"] in loudness.WRITABLE:
+                try:
+                    gains = loudness.measure_audio(part)
+                    loudness.write_tags(part, facts["format"], gains, track_only=True)
+                except Exception as error:
+                    LOGGER.warning("LOUD-DOWNLOAD-FAIL %s %s", job["filename"], loudness._reason(error))
             with self._lock:
                 job.update(facts)
             stem, suffix = job["filename"].rsplit(".", 1)[0], facts["format"]

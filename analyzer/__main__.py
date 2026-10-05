@@ -1,10 +1,11 @@
 import argparse
 import ipaddress
+import json
 import os
 import threading
 import time
 
-from . import log
+from . import log, loudness
 from .access import AccessSettings
 from .accounts import AccountStore
 from .ask import Asker
@@ -35,6 +36,17 @@ def _run_sources(runner, sources):
                 LOGGER.exception("SOURCE-CYCLE %s failed", step.__name__)
 
 
+def _measure_loudness(args):
+    try:
+        loudness.measure(args.downloads, args.data, args.out)
+    except (FileNotFoundError, PermissionError):
+        LOGGER.warning("LOUD-SKIP no_library")
+    except loudness.LoudnessError as error:
+        LOGGER.warning("LOUD-SKIP %s", error.code)
+    except Exception as error:
+        LOGGER.warning("LOUD-FAIL measuring %s", type(error).__name__)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="python -m analyzer")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -54,7 +66,23 @@ def main():
     command.add_argument("--interval-hours", type=float, default=24)
     command.add_argument("--port", type=int, default=8790)
     command.add_argument("--downloads", default="/downloads")
+    command = commands.add_parser("loudness")
+    command.add_argument("--library", required=True)
+    command.add_argument("--data", required=True)
+    command.add_argument("--out", required=True)
+    command.add_argument("--music", default="/music")
+    command.add_argument("--remeasure", action="store_true")
+    writing = command.add_mutually_exclusive_group()
+    writing.add_argument("--write", nargs="+")
+    writing.add_argument("--write-all", action="store_true")
     args = parser.parse_args()
+
+    if args.command == "loudness":
+        result = loudness.measure(args.library, args.data, args.out, remeasure=args.remeasure)
+        if args.write is not None or args.write_all:
+            result = loudness.write(args.library, args.data, args.out, args.music, paths=args.write)
+        print(json.dumps(result, ensure_ascii=False))
+        return
 
     if args.command == "run":
         log.setup(args.data)
@@ -107,6 +135,7 @@ def main():
             args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler, llm=llm,
             downloads=Downloads(args.downloads),
             access=access, sources=sources, resolver=resolver, accounts=accounts, personal=personal,
+            loudness=loudness.Loudness(args.downloads, args.data, args.out, args.music),
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
         LOGGER.info("Serving on port %s.", args.port)
@@ -122,6 +151,7 @@ def main():
                 LOGGER.exception("SCAN-ABORT %s", type(exception).__name__)
             else:
                 state.finish_scan(result["analyzed"], result["tracks"])
+            _measure_loudness(args)
             summary = state.snapshot()
             LOGGER.info(
                 "Analyzed %s files; exported %s tracks.",

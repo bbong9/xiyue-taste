@@ -15,6 +15,7 @@ from .accounts import AccountError
 from .ask import ASK_PARTS, AskError
 from .downloads import DownloadError
 from .log import LOGGER
+from .loudness import LoudnessError
 from .personal import PersonalError
 from .resolver import FAMILY_DEFAULTS, OWNER, ResolveError
 from .settings import SettingsError
@@ -57,7 +58,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def __init__(
         self, *args, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-        access=None, sources=None, resolver=None, accounts=None, personal=None, **kwargs,
+        access=None, sources=None, resolver=None, accounts=None, personal=None, loudness=None, **kwargs,
     ):
         self._data = data
         self._state = state
@@ -71,6 +72,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self._resolver = resolver
         self._accounts = accounts
         self._personal = personal
+        self._loudness = loudness
         super().__init__(*args, **kwargs)
 
     def parse_request(self):
@@ -180,6 +182,41 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         LOGGER.warning("SOURCE-PANEL rejected addr=%s", self.client_address[0])
         self._send_json({"error": "home_only"}, 403)
         return False
+
+    def _loudness_available(self):
+        if not self._owner_only():
+            return False
+        if not self._panel_available() or self._loudness is None:
+            self._send_json({"error": "loudness_unconfigured"}, 503)
+            return False
+        return True
+
+    def _post_loudness(self, path):
+        if not self._loudness_available():
+            return
+        body = {} if self.headers.get("Content-Length", "0") == "0" else self._read_json(1024 * 1024)
+        if body is None:
+            return
+        if path == "/api/loudness/scan":
+            remeasure = body.get("remeasure", False)
+            if not isinstance(remeasure, bool):
+                self._send_json({"error": "bad_request"}, 400)
+                return
+            operation, options = "measuring", {"remeasure": remeasure}
+        else:
+            paths = body.get("paths")
+            if "paths" in body and (
+                not isinstance(paths, list) or not all(isinstance(item, str) for item in paths)
+            ):
+                self._send_json({"error": "bad_request"}, 400)
+                return
+            operation, options = "writing", {"paths": paths}
+        try:
+            self._loudness.start(operation, **options)
+        except LoudnessError as error:
+            self._send_json({"error": error.code}, 409 if error.code == "busy" else 500)
+            return
+        self._send_json({"ok": True}, 202)
 
     def _accounts_configured(self, path):
         if path.startswith(("/api/account", "/api/me/")) and (self._accounts is None or self._personal is None):
@@ -431,6 +468,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(payload)
         elif url.path == "/api/sources" or url.path.startswith("/api/source/"):
             self._get_source(url.path)
+        elif url.path == "/api/loudness":
+            if self._loudness_available():
+                self._send_json(self._loudness.snapshot())
         elif url.path.startswith("/api/"):
             if not self._panel_available():
                 self._send_json({"error": "not_found"}, 404)
@@ -499,6 +539,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if path.startswith("/api/"):
             if path.startswith(("/api/account", "/api/me/")):
                 self._post_account(path)
+            elif path in ("/api/loudness/scan", "/api/loudness/write"):
+                self._post_loudness(path)
             elif path == "/api/access":
                 if not self._owner_only():
                     return
@@ -654,7 +696,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
 def make_server(
     out, port, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-    access=None, sources=None, resolver=None, accounts=None, personal=None,
+    access=None, sources=None, resolver=None, accounts=None, personal=None, loudness=None,
 ):
     if access is None:
         access = AccessSettings(None, network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2")
@@ -662,6 +704,7 @@ def make_server(
         _Handler, directory=str(out), data=data, state=state, index=index, asker=asker, butler=butler, llm=llm,
         downloads=downloads,
         access=access, sources=sources, resolver=resolver, accounts=accounts, personal=personal,
+        loudness=loudness,
     )
     return http.server.ThreadingHTTPServer(("", port), handler)
 

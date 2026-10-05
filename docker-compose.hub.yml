@@ -15,7 +15,7 @@ services:
     volumes:
       # 音乐库：只读，用来分析
       - { type: bind, source: *music, target: /music, read_only: true }
-      # 同一个音乐库：可写，App 让 NAS 下的歌存进来（只新增，不改不删已有的歌）
+      # 同一个音乐库：可写。App 让 NAS 下的歌存进来；曲库管家要求时，给歌曲写入回放增益（响度）标签，只改标签、不改声音，保留修改时间。
       - { type: bind, source: *music, target: /downloads }
       # 容器自己的设置和分析结果，放在本文件夹下
       - ./data:/data

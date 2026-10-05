@@ -14,6 +14,7 @@ services:
       - "${MUSIC_DIR}:/music:ro"
       - "./data:/data"
       - "${OUT_DIR}:/out"
+      # 同一个音乐库：可写。App 让 NAS 下的歌存进来；曲库管家要求时，给歌曲写入回放增益（响度）标签，只改标签、不改声音，保留修改时间。
       - "${DOWNLOAD_DIR:-./downloads}:/downloads"
     ports:
       - "0.0.0.0:8790:8790"
