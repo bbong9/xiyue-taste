@@ -4,6 +4,7 @@ Album gain uses a duration-weighted energy average of track loudness. It can
 differ by a few tenths of a dB from measuring the concatenated album.
 """
 
+import errno
 import fcntl
 import gzip
 import json
@@ -51,7 +52,17 @@ class LoudnessError(Exception):
 
 
 def _reason(error):
-    return error.code if isinstance(error, LoudnessError) else type(error).__name__
+    if isinstance(error, LoudnessError):
+        return error.code
+    if isinstance(error, OSError):
+        reasons = {
+            errno.ENAMETOOLONG: "name_too_long",
+            errno.EACCES: "permission_denied", errno.EPERM: "permission_denied",
+            errno.ENOSPC: "no_space", errno.EDQUOT: "no_space",
+            errno.EROFS: "read_only",
+        }
+        return reasons.get(error.errno, type(error).__name__)
+    return type(error).__name__
 
 
 def _now():
@@ -433,7 +444,7 @@ def _write_one(library, data, connection, row):
         if path.is_symlink():
             raise LoudnessError("symlink")
         signature, metadata = _audio_signature(path, row["format"]), _metadata(path)
-        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".xiyue-rg-", suffix="-" + path.name, delete=False) as file:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".xiyue-rg-", suffix=path.suffix, delete=False) as file:
             temporary = Path(file.name)
         shutil.copyfile(path, temporary)
         write_tags(temporary, row["format"], row)
@@ -568,6 +579,11 @@ class Loudness:
                 "unsupported": sum(row["format"] not in WRITABLE for row in good),
             },
             "pending": [row["path"] for row in rows if _pending(row)],
+            "problems": [
+                {"path": row["path"], "stage": "measure" if row["error"] else "write",
+                 "reason": row["error"] or row["write_error"]}
+                for row in rows if row["error"] or row["write_error"]
+            ][:200],
         }
 
     def start(self, operation, **options):

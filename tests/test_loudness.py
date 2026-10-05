@@ -1,5 +1,6 @@
 """Loudness measurement, safe tag writes and the owner's asynchronous API."""
 
+import errno
 import gzip
 import ipaddress
 import json
@@ -250,6 +251,81 @@ def test_write_flac_preserves_audio_metadata_times_and_permissions(folders, monk
     assert not list(library.glob(".xiyue-rg-*"))
     assert _rows(data)["a.flac"]["source"] == "written"
     assert _exported(out)["tracks"][0]["source"] == "written"
+
+
+def test_write_flac_with_long_utf8_name(folders, monkeypatch):
+    library, data, out = folders
+    name = "歌あ" * 41 + "abc.flac"
+    assert 250 < len(name.encode("utf-8")) <= 255
+    path = _flac(library / name)
+    _ffmpeg(monkeypatch)
+    loudness.measure(library, data, out)
+    assert loudness.write(library, data, out, library) == {
+        "written": [name], "failed": [], "skipped": [],
+    }
+    assert path.name == name and path.is_file()
+    assert FLAC(path)["REPLAYGAIN_TRACK_GAIN"] == ["+9.80 dB"]
+    assert not list(library.glob(".xiyue-rg-*"))
+
+
+@pytest.mark.parametrize(("error", "reason"), [
+    (OSError(errno.ENAMETOOLONG, "long"), "name_too_long"),
+    (OSError(errno.EACCES, "denied"), "permission_denied"),
+    (OSError(errno.EPERM, "denied"), "permission_denied"),
+    (OSError(errno.ENOSPC, "full"), "no_space"),
+    (OSError(errno.EDQUOT, "quota"), "no_space"),
+    (OSError(errno.EROFS, "read only"), "read_only"),
+    (OSError(errno.EIO, "other"), "OSError"),
+    (OSError(errno.ENOENT, "missing"), "FileNotFoundError"),
+    (loudness.LoudnessError("silent"), "silent"),
+])
+def test_reason_classifies_common_os_errors(error, reason):
+    assert loudness._reason(error) == reason
+
+
+def test_snapshot_lists_problems_without_changing_existing_fields(folders, monkeypatch):
+    library, data, out = folders
+    _flac(library / "a-measure.flac")
+    _flac(library / "b-write.flac")
+    _ffmpeg(monkeypatch, {"a-measure.flac": _summary(-70, -24)})
+    loudness.measure(library, data, out)
+    service = loudness.Loudness(library, data, out, library)
+    before = service.snapshot()
+
+    def fail_write(*args, **kwargs):
+        raise OSError(errno.ENAMETOOLONG, "long")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(loudness, "write_tags", fail_write)
+        assert loudness.write(library, data, out, library)["failed"] == [
+            {"path": "b-write.flac", "reason": "name_too_long"},
+        ]
+    with loudness._database(data) as connection:
+        connection.execute("UPDATE loudness SET write_error='permission_denied' WHERE path='a-measure.flac'")
+        connection.commit()
+    state = loudness._read_state(data)
+    snapshot = service.snapshot()
+    assert snapshot["problems"] == [
+        {"path": "a-measure.flac", "stage": "measure", "reason": "silent"},
+        {"path": "b-write.flac", "stage": "write", "reason": "name_too_long"},
+    ]
+    assert snapshot["counts"] == before["counts"] == {
+        "fromTags": 0, "measured": 1, "written": 0, "failed": 1, "unsupported": 0,
+    }
+    assert snapshot["pending"] == before["pending"] == ["b-write.flac"]
+    assert {key: snapshot[key] for key in state} == state
+    assert loudness.write(library, data, out, library)["written"] == ["b-write.flac"]
+    assert service.snapshot()["problems"] == [
+        {"path": "a-measure.flac", "stage": "measure", "reason": "silent"},
+    ]
+    with loudness._database(data) as connection:
+        for number in reversed(range(201)):
+            loudness._save_row(connection, {"path": f"limit/{number:03}.flac", "error": "silent"})
+    problems = service.snapshot()["problems"]
+    assert len(problems) == 200
+    assert [item["path"] for item in problems] == ["a-measure.flac"] + [
+        f"limit/{number:03}.flac" for number in range(199)
+    ]
 
 
 def test_write_changed_file_is_skipped_and_marked_for_remeasure(folders, monkeypatch):

@@ -4,19 +4,20 @@ import json
 import os
 import threading
 import time
+from collections import Counter
 
 from . import log, loudness
 from .access import AccessSettings
 from .accounts import AccountStore
 from .ask import Asker
 from .butler import Butler
-from .downloads import Downloads
+from .downloads import Downloads, _library_files, majority_owner
 from .lxhost import Runner
 from .panel import OutputIndex, PanelState
 from .personal import PersonalStore
 from .log import LOGGER
 from .resolver import Resolver
-from .scan import probe_worker, scan
+from .scan import AUDIO_EXTENSIONS, probe_worker, scan
 from .serve import make_server
 from .settings import LLMSettings
 from .sources import SourceStore
@@ -47,6 +48,34 @@ def _measure_loudness(args):
         LOGGER.warning("LOUD-FAIL measuring %s", type(error).__name__)
 
 
+def _own_files(args):
+    owner = majority_owner(args.library)
+    if owner is None:
+        print(json.dumps({"error": "no_non_root_audio"}))
+        raise SystemExit(1)
+    uid, gid, mode = owner
+    extensions = AUDIO_EXTENSIONS | {".lrc", ".jpg", ".jpeg", ".png"}
+    files = [path for path, info in _library_files(args.library, extensions) if info.st_uid == 0]
+    if not args.apply:
+        print(json.dumps({
+            "owner": f"{uid}:{gid}", "mode": f"{mode:o}", "files": len(files),
+            "byExtension": dict(sorted(Counter(path.suffix.lower() for path in files).items())),
+        }))
+        return
+    changed, failed = 0, Counter()
+    for path in files:
+        try:
+            os.chown(path, uid, gid)
+            os.chmod(path, mode)
+            changed += 1
+        except OSError as error:
+            failed[loudness._reason(error)] += 1
+    result = {"changed": changed, "failed": sum(failed.values())}
+    if failed:
+        result["byReason"] = dict(sorted(failed.items()))
+    print(json.dumps(result))
+
+
 def main():
     parser = argparse.ArgumentParser(prog="python -m analyzer")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -75,7 +104,14 @@ def main():
     writing = command.add_mutually_exclusive_group()
     writing.add_argument("--write", nargs="+")
     writing.add_argument("--write-all", action="store_true")
+    command = commands.add_parser("own-files")
+    command.add_argument("--library", required=True)
+    command.add_argument("--apply", action="store_true")
     args = parser.parse_args()
+
+    if args.command == "own-files":
+        _own_files(args)
+        return
 
     if args.command == "loudness":
         result = loudness.measure(args.library, args.data, args.out, remeasure=args.remeasure)

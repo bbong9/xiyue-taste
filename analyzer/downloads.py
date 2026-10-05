@@ -5,13 +5,14 @@ import os
 import re
 import shutil
 import socket
+import stat
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 import mutagen
@@ -26,6 +27,7 @@ from mutagen.wave import WAVE
 
 from . import loudness
 from .log import LOGGER
+from .scan import AUDIO_EXTENSIONS as LIBRARY_AUDIO_EXTENSIONS
 
 AUDIO_EXTENSIONS = ("flac", "mp3", "m4a", "aac", "ogg", "opus", "wav", "ape")
 MAX_AUDIO_BYTES = 600 * 1024 * 1024
@@ -151,6 +153,30 @@ def _directory(value):
     return directory
 
 
+def _library_files(root, extensions):
+    """Visible regular files only; never follow links or enter hidden folders."""
+    for directory, directories, names in os.walk(root):
+        directories[:] = sorted(name for name in directories if not name.startswith("."))
+        for name in sorted(names):
+            path = Path(directory) / name
+            if name.startswith(".") or path.suffix.lower() not in extensions:
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                yield path, info
+
+
+def majority_owner(root):
+    owners = Counter(
+        (info.st_uid, info.st_gid, info.st_mode & 0o7777)
+        for _, info in _library_files(root, LIBRARY_AUDIO_EXTENSIONS) if info.st_uid != 0
+    )
+    return owners.most_common(1)[0][0] if owners else None
+
+
 class Downloads:
     """Songs the phone asks this NAS to fetch itself: one at a time, into the
     downloads folder and nowhere else. Addresses are used, never listed."""
@@ -162,6 +188,8 @@ class Downloads:
         self._wake = threading.Condition(self._lock)
         self._jobs = {}
         self._waiting = deque()
+        self._owner = None
+        self._owner_checked_at = None
         threading.Thread(target=self._work, daemon=True).start()
 
     def available(self):
@@ -296,12 +324,21 @@ class Downloads:
                 self._finish(job, state, error, path)
 
     def _own(self, path, folder=False):
-        # As whoever owns the downloads folder, so the NAS's own apps and
-        # WebDAV can still rename and delete what lands here.
         try:
-            owner = self._root.stat()
-            os.chown(path, owner.st_uid, owner.st_gid)
-            os.chmod(path, owner.st_mode & (0o777 if folder else 0o666))
+            now = time.monotonic()
+            if self._owner_checked_at is None or now - self._owner_checked_at >= 3600:
+                self._owner = majority_owner(self._root)
+                self._owner_checked_at = now
+            if self._owner is not None:
+                uid, gid, mode = self._owner
+                if folder:
+                    mode |= 0o100 | (0o010 if mode & 0o040 else 0) | (0o001 if mode & 0o004 else 0)
+            else:
+                owner = self._root.stat()
+                uid, gid = owner.st_uid, owner.st_gid
+                mode = owner.st_mode & (0o777 if folder else 0o666)
+            os.chown(path, uid, gid)
+            os.chmod(path, mode)
         except OSError:
             pass
 
@@ -366,6 +403,10 @@ class Downloads:
             with self._lock:
                 job.update(facts)
             stem, suffix = job["filename"].rsplit(".", 1)[0], facts["format"]
+            # Reserve room for the largest audio/sidecar suffix and " (99)".
+            limit = 255 - len(" (99)") - max(map(len, (".flac", ".lrc", ".jpeg")))
+            if len(stem.encode("utf-8")) > limit:
+                stem = stem.encode("utf-8")[:limit].decode("utf-8", "ignore").strip()
             final = directory / f"{stem}.{suffix}"
             for number in range(2, 100):
                 if not final.exists():

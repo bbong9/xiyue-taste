@@ -1,4 +1,5 @@
 import base64
+import errno
 import gzip
 import http.client
 import http.server
@@ -6,6 +7,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -14,6 +16,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import mutagen.flac
 import numpy as np
@@ -990,6 +993,192 @@ def test_download_keeps_both_when_the_name_is_taken(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize(("cover", "extension"), [
+    (b"\xff\xd8\xff" + bytes(10), ".jpg"),
+    (b"\x89PNG\r\n\x1a\n" + bytes(10), ".png"),
+])
+def test_download_truncates_utf8_names_and_keeps_sidecars(tmp_path, monkeypatch, cover, extension):
+    def missing_ffmpeg(path):
+        raise loudness.LoudnessError("ffmpeg_missing")
+
+    monkeypatch.setattr(loudness, "measure_audio", missing_ffmpeg)
+    server, base = _file_server({"/a": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        filename = "长い" * 50 + ".mp3"
+        assert len(filename.encode("utf-8")) > 300
+        body = {
+            "url": base + "/a", "filename": filename, "lyrics": "[00:01.00]词",
+            "cover": base64.b64encode(cover).decode("ascii"),
+        }
+        paths = []
+        for _ in range(2):
+            job = _wait_for(downloads, downloads.submit(body))
+            assert job["state"] == "done"
+            path = tmp_path / job["path"]
+            paths.append(path)
+            for saved in (path, path.with_suffix(".lrc"), path.with_suffix(extension)):
+                encoded = saved.name.encode("utf-8")
+                assert len(encoded) <= 255 and encoded.decode("utf-8") == saved.name
+                assert saved.is_file()
+            assert path.suffix == ".flac"
+            assert path.with_suffix(".lrc").read_text(encoding="utf-8") == body["lyrics"]
+            assert path.with_suffix(extension).read_bytes() == cover
+        assert paths[1].stem == paths[0].stem + " (2)"
+        assert not list(tmp_path.glob(".xiyue-part-*"))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _mock_file_owners(monkeypatch, owners):
+    original = Path.lstat
+
+    def lstat(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if path not in owners:
+            return info
+        uid, gid, mode = owners[path]
+        return SimpleNamespace(st_uid=uid, st_gid=gid, st_mode=stat.S_IFMT(info.st_mode) | mode)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+
+
+@pytest.mark.parametrize(("mode", "folder_mode"), [(0o640, 0o750), (0o705, 0o705)])
+def test_download_uses_majority_owner_and_caches_for_an_hour(tmp_path, monkeypatch, mode, folder_mode):
+    from analyzer import downloads as module
+
+    library = tmp_path / "library"
+    library.mkdir()
+    owners = {}
+    for name, uid in (("a.flac", 1000), ("b.MP3", 1000), ("c.aiff", 1000), ("root.flac", 0)):
+        path = library / name
+        path.write_bytes(b"audio")
+        owners[path] = (uid, 0, mode if uid else 0o604)
+    for number in range(4):
+        path = library / ".trash" / f"{number}.flac"
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b"audio")
+        owners[path] = (2000, 20, 0o600)
+    _mock_file_owners(monkeypatch, owners)
+    original_stat = Path.stat
+    monkeypatch.setattr(Path, "stat", lambda path, *args, **kwargs: (
+        SimpleNamespace(st_uid=0, st_gid=0, st_mode=stat.S_IFDIR | 0o705)
+        if path == library else original_stat(path, *args, **kwargs)
+    ))
+    calls, clock, checked = [], [0], []
+    original_owner = module.majority_owner
+
+    def majority(root):
+        checked.append(root)
+        return original_owner(root)
+
+    monkeypatch.setattr(module, "majority_owner", majority)
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(os, "chown", lambda path, uid, gid: calls.append(("chown", path, uid, gid)))
+    monkeypatch.setattr(os, "chmod", lambda path, mode: calls.append(("chmod", path, mode)))
+    downloads = Downloads(library, allow_private=True)
+    assert checked == [], "启动时不遍历曲库"
+    target, folder = library / "new.flac", library / "new"
+    downloads._own(target)
+    downloads._own(folder, folder=True)
+    assert calls == [
+        ("chown", target, 1000, 0), ("chmod", target, mode),
+        ("chown", folder, 1000, 0), ("chmod", folder, folder_mode),
+    ]
+    assert checked == [library]
+    for path in owners:
+        owners[path] = (0, 0, 0o604)
+    clock[0] = 3599
+    downloads._own(target)
+    assert calls[-2:] == [("chown", target, 1000, 0), ("chmod", target, mode)]
+    assert checked == [library]
+    clock[0] = 3600
+    downloads._own(target)
+    downloads._own(folder, folder=True)
+    assert calls[-4:] == [
+        ("chown", target, 0, 0), ("chmod", target, 0o604),
+        ("chown", folder, 0, 0), ("chmod", folder, 0o705),
+    ]
+    assert checked == [library, library]
+
+
+def test_own_files_preview_and_apply_skip_hidden_and_links(tmp_path, monkeypatch, capsys):
+    from analyzer import __main__ as command
+
+    library = tmp_path / "library"
+    library.mkdir()
+    owners = {}
+    for name in ("a.flac", "b.mp3", "c.aiff", "user.lrc"):
+        path = library / name
+        path.write_bytes(b"audio")
+        owners[path] = (1000, 0, 0o705)
+    root_files = []
+    for extension in (".flac", ".wma", ".lrc", ".jpg", ".jpeg", ".png"):
+        path = library / ("root" + extension)
+        path.write_bytes(b"audio")
+        owners[path] = (0, 0, 0o604)
+        root_files.append(path)
+    for name in (".hidden.flac", ".trash/hidden.flac", "other.txt"):
+        path = library / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b"audio")
+        owners[path] = (0, 0, 0o604)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "song.flac").write_bytes(b"audio")
+    (library / "link.flac").symlink_to(outside / "song.flac")
+    (library / "linked").symlink_to(outside, target_is_directory=True)
+    _mock_file_owners(monkeypatch, owners)
+    calls, times = [], {path: path.stat().st_mtime_ns for path in root_files}
+    blocked = root_files[0]
+    original_chmod = os.chmod
+
+    def chown(path, uid, gid):
+        calls.append(("chown", path, uid, gid))
+        if path == blocked:
+            raise OSError(errno.EACCES, "denied")
+        owners[path] = (uid, gid, owners[path][2])
+
+    def chmod(path, mode):
+        calls.append(("chmod", path, mode))
+        original_chmod(path, mode)
+        owners[path] = (*owners[path][:2], mode)
+
+    monkeypatch.setattr(os, "chown", chown)
+    monkeypatch.setattr(os, "chmod", chmod)
+    monkeypatch.setattr(sys, "argv", ["analyzer", "own-files", "--library", str(library)])
+    command.main()
+    assert json.loads(capsys.readouterr().out) == {
+        "owner": "1000:0", "mode": "705", "files": 6,
+        "byExtension": {".flac": 1, ".wma": 1, ".lrc": 1, ".jpg": 1, ".jpeg": 1, ".png": 1},
+    }
+    assert calls == []
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--apply"])
+    command.main()
+    assert json.loads(capsys.readouterr().out) == {
+        "changed": 5, "failed": 1, "byReason": {"permission_denied": 1},
+    }
+    assert {call[1] for call in calls if call[0] == "chown"} == set(root_files)
+    assert {call[1] for call in calls if call[0] == "chmod"} == set(root_files) - {blocked}
+    assert all(call[2:] == (1000, 0) for call in calls if call[0] == "chown")
+    assert all(call[2] == 0o705 for call in calls if call[0] == "chmod")
+    assert {path: path.stat().st_mtime_ns for path in root_files} == times
+    blocked = None
+    calls.clear()
+    command.main()
+    assert json.loads(capsys.readouterr().out) == {"changed": 1, "failed": 0}
+    assert calls == [("chown", root_files[0], 1000, 0), ("chmod", root_files[0], 0o705)]
+    for path in owners:
+        owners[path] = (0, 0, 0o604)
+    calls.clear()
+    with pytest.raises(SystemExit) as failure:
+        command.main()
+    assert failure.value.code == 1
+    assert json.loads(capsys.readouterr().out) == {"error": "no_non_root_audio"}
+    assert calls == []
 
 
 def test_download_refuses_bad_names_and_addresses(tmp_path):
