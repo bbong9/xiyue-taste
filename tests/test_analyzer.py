@@ -949,6 +949,59 @@ def _wait_for(downloads, job_id):
     raise AssertionError("download did not finish")
 
 
+@pytest.mark.parametrize("outcome", ["tagged", "measure_failed", "write_failed", "unsupported"])
+def test_download_snapshot_returns_only_written_loudness(tmp_path, monkeypatch, outcome):
+    from analyzer import downloads as download_module, loudness
+
+    measured = []
+    written = []
+    fixed = {"track_gain": 2.5, "track_peak": 0.9}
+    real_write = loudness.write_tags
+
+    def measure(path):
+        measured.append(path)
+        if outcome == "measure_failed":
+            raise loudness.LoudnessError("no_summary")
+        return fixed.copy()
+
+    def write(path, format, gains, track_only=False):
+        written.append(gains.copy())
+        if outcome == "write_failed":
+            raise OSError("fixture tag failure")
+        real_write(path, format, gains, track_only=track_only)
+
+    payload = _AUDIO
+    if outcome == "unsupported":
+        wave = io.BytesIO()
+        sf.write(wave, np.zeros(44100 * 3), 44100, format="WAV", subtype="PCM_16")
+        payload = wave.getvalue()
+    monkeypatch.setattr(download_module, "_facts", lambda _: {
+        "format": "wav" if outcome == "unsupported" else "flac",
+        "durationMs": 3000, "sampleRate": 44100, "bitDepth": 16, "bitRate": 0,
+    })
+    monkeypatch.setattr(loudness, "measure_audio", measure)
+    monkeypatch.setattr(loudness, "write_tags", write)
+    server, base = _file_server({"/song": (200, payload)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        job = _wait_for(downloads, downloads.submit({"url": base + "/song", "filename": "song.flac"}))
+        assert job["state"] == "done"
+        assert "trackGain" in job and "trackPeak" in job
+        if outcome == "tagged":
+            assert (job["trackGain"], job["trackPeak"]) == (2.5, 0.9)
+            assert written == [fixed]
+            tags = loudness.read_gains(tmp_path / job["path"], "flac")
+            assert tags["track_gain"] == job["trackGain"]
+            assert tags["track_peak"] == job["trackPeak"]
+        else:
+            assert job["trackGain"] is None and job["trackPeak"] is None
+        if outcome == "unsupported":
+            assert measured == [] and written == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_download_on_done_runs_once_after_finish_outside_lock(tmp_path, monkeypatch):
     called = threading.Event()
     snapshots = []

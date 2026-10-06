@@ -230,6 +230,7 @@ class Downloads:
             "host": urllib.parse.urlsplit(url).hostname,
             "createdAt": time.time(), "finishedAt": None,
             "format": "", "durationMs": 0, "sampleRate": 0, "bitDepth": 0, "bitRate": 0,
+            "trackGain": None, "trackPeak": None,
             "minDurationMs": minimum,
             "sourceName": source_name,
             "url": url,
@@ -255,7 +256,8 @@ class Downloads:
 
     def snapshot(self):
         names = ("id", "filename", "directory", "state", "received", "total", "error", "path", "host",
-                 "createdAt", "finishedAt", "format", "durationMs", "sampleRate", "bitDepth", "bitRate", "sourceName", "account")
+                 "createdAt", "finishedAt", "format", "durationMs", "sampleRate", "bitDepth", "bitRate",
+                 "trackGain", "trackPeak", "sourceName", "account")
         with self._lock:
             return [{name: job[name] for name in names} for job in list(self._jobs.values())[::-1][:100]]
 
@@ -400,14 +402,18 @@ class Downloads:
             facts = _facts(part)
             if facts["durationMs"] < job["minDurationMs"]:
                 raise DownloadError("too_short")
+            written_gains = None
             if facts["format"] in loudness.WRITABLE:
                 try:
                     gains = loudness.measure_audio(part)
                     loudness.write_tags(part, facts["format"], gains, track_only=True)
+                    written_gains = gains
                 except Exception as error:
                     LOGGER.warning("LOUD-DOWNLOAD-FAIL %s %s", job["filename"], loudness._reason(error))
             with self._lock:
                 job.update(facts)
+                if written_gains is not None:
+                    job.update(trackGain=written_gains["track_gain"], trackPeak=written_gains["track_peak"])
             stem, suffix = job["filename"].rsplit(".", 1)[0], facts["format"]
             # Reserve room for the largest audio/sidecar suffix and " (99)".
             limit = 255 - len(" (99)") - max(map(len, (".flac", ".lrc", ".jpeg")))
