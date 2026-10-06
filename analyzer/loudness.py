@@ -34,6 +34,7 @@ from .scan import AUDIO_EXTENSIONS
 
 WRITABLE = {"flac", "mp3", "m4a"}
 _MEASURE_RETRY_SECONDS = 30
+_FOLLOWUP_SECONDS = (45, 150, 420)
 TAG_NAMES = {
     "track_gain": "REPLAYGAIN_TRACK_GAIN", "track_peak": "REPLAYGAIN_TRACK_PEAK",
     "album_gain": "REPLAYGAIN_ALBUM_GAIN", "album_peak": "REPLAYGAIN_ALBUM_PEAK",
@@ -562,12 +563,67 @@ class Loudness:
         self.library, self.data, self.out, self.music = library, data, out, music
         self._measure_request_lock = threading.Lock()
         self._measure_retry = None
+        self._followup_lock = threading.Lock()
+        self._followup_files: dict[str, tuple | None] = {}
+        self._followup_timer = None
+        self._followup_generation = None
+        self._followup_started = 0
 
-    def request_measure(self):
+    def request_measure(self, path=None):
         """Incrementally measure after a download, coalescing retries while busy."""
+        if path:
+            with self._followup_lock:
+                self._followup_files[path] = self._followup_stat(path)
+                if self._followup_timer is not None:
+                    self._followup_timer.cancel()
+                self._followup_generation = object()
+                self._followup_started = time.monotonic()
+                self._schedule_followup(0, self._followup_generation)
         with self._measure_request_lock:
             if self._measure_retry is None:
                 self._request_measure(20)
+
+    def _followup_stat(self, path):
+        try:
+            stat = os.stat(Path(self.library) / path)
+        except OSError:
+            return None
+        return stat.st_size, stat.st_mtime
+
+    def _schedule_followup(self, index, generation):
+        delay = max(0, self._followup_started + _FOLLOWUP_SECONDS[index] - time.monotonic())
+        self._followup_timer = threading.Timer(delay, self._check_followup, args=(index, generation))
+        self._followup_timer.daemon = True
+        self._followup_timer.start()
+
+    def _check_followup(self, index, generation):
+        with self._followup_lock:
+            # A cancelled timer may already have entered its callback.
+            if generation is not self._followup_generation:
+                return
+            changed = 0
+            for path, previous in self._followup_files.items():
+                current = self._followup_stat(path)
+                if current != previous:
+                    changed += 1
+                    self._followup_files[path] = current
+            total = len(self._followup_files)
+        if changed:
+            LOGGER.info("LOUD-FOLLOWUP run changed=%s files=%s", changed, total)
+            try:
+                self.request_measure()
+            except Exception:
+                LOGGER.warning("LOUD-AFTER-DOWNLOAD failed")
+        else:
+            LOGGER.info("LOUD-FOLLOWUP skipped files=%s", total)
+        with self._followup_lock:
+            if generation is not self._followup_generation:
+                return
+            if index + 1 < len(_FOLLOWUP_SECONDS):
+                self._schedule_followup(index + 1, generation)
+            else:
+                self._followup_files.clear()
+                self._followup_timer = None
 
     def _request_measure(self, retries_left):
         try:

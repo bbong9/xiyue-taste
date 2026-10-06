@@ -327,7 +327,7 @@ class Downloads:
                 self._finish(job, state, error, path)
             if state == "done" and self._on_done is not None:
                 try:
-                    self._on_done()
+                    self._on_done(path)
                 except Exception:
                     LOGGER.warning("LOUD-AFTER-DOWNLOAD failed")
 

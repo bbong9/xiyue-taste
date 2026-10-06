@@ -487,6 +487,172 @@ def _idle(service):
     raise AssertionError("loudness job did not finish")
 
 
+def _finish_followups(service):
+    while True:
+        with service._followup_lock:
+            timer = service._followup_timer
+        if timer is None:
+            return
+        timer.join(3)
+        assert not timer.is_alive(), "follow-up check did not finish"
+
+
+def test_followup_finds_moved_tagged_file_without_ffmpeg(folders, monkeypatch, caplog):
+    library, data, out = folders
+    old = _flac(library / "downloads/a.flac", tags={"REPLAYGAIN_TRACK_GAIN": "-2 dB"})
+    calls = _ffmpeg(monkeypatch)
+    service = loudness.Loudness(library, data, out, library)
+    release = threading.Event()
+    check = service._check_followup
+
+    def gated_check(index, generation):
+        assert release.wait(3)
+        check(index, generation)
+
+    monkeypatch.setattr(loudness, "_FOLLOWUP_SECONDS", (0.05, 0.1, 0.15))
+    monkeypatch.setattr(service, "_check_followup", gated_check)
+    caplog.set_level(logging.INFO, logger="xiyue")
+    try:
+        service.request_measure("downloads/a.flac")
+        assert _idle(service)["lastMeasure"]["fromTags"] == 1
+        assert [track["path"] for track in _exported(out)["tracks"]] == ["downloads/a.flac"]
+        new = library / "最近在听/歌手/专辑/a.flac"
+        new.parent.mkdir(parents=True)
+        old.rename(new)
+        release.set()
+        _finish_followups(service)
+        assert _idle(service)["lastMeasure"]["fromTags"] == 1
+        tracks = _exported(out)["tracks"]
+        assert [track["path"] for track in tracks] == ["最近在听/歌手/专辑/a.flac"]
+        assert tracks[0]["source"] == "tag" and tracks[0]["trackGain"] == -2
+        assert set(_rows(data)) == {"最近在听/歌手/专辑/a.flac"}
+        assert calls == []
+        messages = [record.getMessage() for record in caplog.records if "LOUD-FOLLOWUP" in record.message]
+        assert messages == [
+            "LOUD-FOLLOWUP run changed=1 files=1",
+            "LOUD-FOLLOWUP skipped files=1",
+            "LOUD-FOLLOWUP skipped files=1",
+        ]
+        assert service._followup_files == {}
+    finally:
+        release.set()
+        _finish_followups(service)
+
+
+def test_followup_skips_unchanged_files_and_clears_tracking(folders, monkeypatch, caplog):
+    library, data, out = folders
+    _flac(library / "downloads/a.flac", tags={"REPLAYGAIN_TRACK_GAIN": "-2 dB"})
+    calls = _ffmpeg(monkeypatch)
+    service = loudness.Loudness(library, data, out, library)
+    monkeypatch.setattr(loudness, "_FOLLOWUP_SECONDS", (0.05, 0.1, 0.15))
+    caplog.set_level(logging.INFO, logger="xiyue")
+    service.request_measure("downloads/a.flac")
+    assert service._followup_timer.daemon is True
+    _finish_followups(service)
+    _idle(service)
+    messages = [record.getMessage() for record in caplog.records]
+    assert [message for message in messages if message.startswith("LOUD-FOLLOWUP")] == [
+        "LOUD-FOLLOWUP skipped files=1",
+    ] * 3
+    assert sum(message.startswith("LOUD-START") for message in messages) == 1
+    assert service._followup_files == {}
+    assert service._followup_timer is None
+    assert calls == []
+
+
+def test_followup_new_download_restarts_one_cumulative_timer(folders, monkeypatch, caplog):
+    library, data, out = folders
+    _flac(library / "downloads/a.flac", tags={"REPLAYGAIN_TRACK_GAIN": "-2 dB"})
+    _flac(library / "downloads/b.flac", tags={"REPLAYGAIN_TRACK_GAIN": "-3 dB"})
+    service = loudness.Loudness(library, data, out, library)
+    timers, clock = [], [100.0]
+
+    class Timer:
+        def __init__(self, seconds, function, args):
+            self.seconds, self.function, self.args = seconds, function, args
+            self.cancelled = self.fired = False
+
+        def start(self):
+            timers.append(self)
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            self.fired = True
+            self.function(*self.args)
+
+    monkeypatch.setattr(loudness, "_FOLLOWUP_SECONDS", (0.05, 0.1, 0.15))
+    monkeypatch.setattr(loudness.threading, "Timer", Timer)
+    monkeypatch.setattr(loudness.time, "monotonic", lambda: clock[0])
+    caplog.set_level(logging.INFO, logger="xiyue")
+    service.request_measure("downloads/a.flac")
+    _idle(service)
+    first = service._followup_timer
+    clock[0] = 100.02
+    service.request_measure("downloads/b.flac")
+    _idle(service)
+    second = service._followup_timer
+    assert first.cancelled and second is not first
+    assert [timer for timer in timers if not timer.cancelled and not timer.fired] == [second]
+    assert second.seconds == pytest.approx(0.05)
+    assert set(service._followup_files) == {"downloads/a.flac", "downloads/b.flac"}
+    # Even a callback that had already entered before cancellation cannot
+    # clear the new round's files or schedule another timer.
+    first.fire()
+    assert service._followup_timer is second and len(timers) == 2
+    for instant in (100.07, 100.12, 100.17):
+        timer = service._followup_timer
+        assert timer.daemon is True
+        assert timer.seconds == pytest.approx(0.05)
+        clock[0] = instant
+        timer.fire()
+    assert service._followup_timer is None
+    assert service._followup_files == {}
+    assert [timer for timer in timers if not timer.cancelled and not timer.fired] == []
+    messages = [record.getMessage() for record in caplog.records if "LOUD-FOLLOWUP" in record.message]
+    assert messages == ["LOUD-FOLLOWUP skipped files=2"] * 3
+
+
+def test_followup_uses_existing_busy_retry_then_measures(folders, monkeypatch, caplog):
+    library, data, out = folders
+    old = _flac(library / "downloads/a.flac", tags={"REPLAYGAIN_TRACK_GAIN": "-2 dB"})
+    calls = _ffmpeg(monkeypatch)
+    service = loudness.Loudness(library, data, out, library)
+    entered, release = threading.Event(), threading.Event()
+    retry = service._retry_measure
+
+    def gated_retry(retries_left):
+        entered.set()
+        assert release.wait(3)
+        retry(retries_left)
+
+    monkeypatch.setattr(loudness, "_FOLLOWUP_SECONDS", (0.05, 0.1, 0.15))
+    monkeypatch.setattr(loudness, "_MEASURE_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(service, "_retry_measure", gated_retry)
+    caplog.set_level(logging.INFO, logger="xiyue")
+    try:
+        service.request_measure("downloads/a.flac")
+        _idle(service)
+        with loudness._acquire(data):
+            old.rename(library / "moved.flac")
+            assert entered.wait(3)
+            timer = service._measure_retry
+            assert timer is not None
+            assert any(record.getMessage() == "LOUD-AFTER-DOWNLOAD busy_retry" for record in caplog.records)
+        release.set()
+        timer.join(3)
+        assert not timer.is_alive()
+        _finish_followups(service)
+        assert _idle(service)["lastMeasure"]["fromTags"] == 1
+        assert [track["path"] for track in _exported(out)["tracks"]] == ["moved.flac"]
+        assert service._measure_retry is None
+        assert calls == []
+    finally:
+        release.set()
+        _finish_followups(service)
+
+
 def test_request_measure_starts_incrementally_and_exports_new_track(folders, monkeypatch, caplog):
     library, data, out = folders
     _flac(library / "old.flac", tags={"REPLAYGAIN_TRACK_GAIN": "-1 dB"})

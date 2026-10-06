@@ -1005,8 +1005,10 @@ def test_download_snapshot_returns_only_written_loudness(tmp_path, monkeypatch, 
 def test_download_on_done_runs_once_after_finish_outside_lock(tmp_path, monkeypatch):
     called = threading.Event()
     snapshots = []
+    paths = []
 
-    def on_done():
+    def on_done(path):
+        paths.append(path)
         snapshots.append(downloads.snapshot())
         called.set()
 
@@ -1019,14 +1021,17 @@ def test_download_on_done_runs_once_after_finish_outside_lock(tmp_path, monkeypa
     assert snapshots[0][0]["state"] == "done"
     assert snapshots[0][0]["finishedAt"] is not None
     assert _wait_for(downloads, job_id)["state"] == "done"
+    assert paths == [snapshots[0][0]["path"]] == ["song.flac"]
 
 
 @pytest.mark.parametrize("reason,state", [("not_audio", "failed"), ("cancelled", "cancelled")])
 def test_download_on_done_skips_failed_and_cancelled(tmp_path, monkeypatch, reason, state):
     finished = threading.Event()
     callbacks = []
+    paths = []
 
-    def on_done():
+    def on_done(path):
+        paths.append(path)
         snapshot = downloads.snapshot()
         callbacks.append([job["state"] for job in snapshot])
         if len(snapshot) == 2 and all(job["finishedAt"] is not None for job in snapshot):
@@ -1045,13 +1050,16 @@ def test_download_on_done_skips_failed_and_cancelled(tmp_path, monkeypatch, reas
     assert _wait_for(downloads, bad)["state"] == state
     assert _wait_for(downloads, good)["state"] == "done"
     assert callbacks == [["done", state]]
+    assert paths == [_wait_for(downloads, good)["path"]] == ["good.flac"]
 
 
 def test_download_on_done_failure_keeps_job_done_and_worker_running(tmp_path, monkeypatch, caplog):
     finished = threading.Event()
     calls = []
+    paths = []
 
-    def on_done():
+    def on_done(path):
+        paths.append(path)
         calls.append(downloads.snapshot())
         if len(calls) == 1:
             raise RuntimeError("private/path/song.flac")
@@ -1065,6 +1073,8 @@ def test_download_on_done_failure_keeps_job_done_and_worker_running(tmp_path, mo
     assert len(calls) == 2
     assert _wait_for(downloads, first)["state"] == "done"
     assert _wait_for(downloads, second)["state"] == "done"
+    assert paths == [_wait_for(downloads, first)["path"], _wait_for(downloads, second)["path"]]
+    assert paths == ["one.flac", "two.flac"]
     messages = [record.getMessage() for record in caplog.records if "LOUD-AFTER-DOWNLOAD" in record.message]
     assert messages == ["LOUD-AFTER-DOWNLOAD failed"]
     assert "private/path" not in caplog.text
