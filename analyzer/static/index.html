@@ -680,8 +680,9 @@
       $("count").textContent = status.trackCount.toLocaleString("zh-CN");
       renderTime("last-scan", status.finishedAt);
       renderTime("next-scan", status.nextScanAt);
-      $("scan-error").hidden = !status.error;
-      $("scan-error").textContent = status.error === "WorkersKeepDying" ? "上次扫描中断：分析进程接连被系统结束，多半是 NAS 内存不够或处理器太老。" : status.error ? `上次扫描出错：${status.error}` : "";
+      const warning = status.warning === "no_audio" ? "上次扫描没有找到任何音频文件：请检查音乐目录是否挂对、里面是否有歌（日志里有 EMPTY-OUTPUT 详情）。" : status.warning === "all_failed" ? "上次扫描找到了歌，但全部分析失败，没有导出任何歌曲（日志里有 EMPTY-OUTPUT 详情）。" : "";
+      $("scan-error").hidden = !status.error && !warning;
+      $("scan-error").textContent = status.error === "WorkersKeepDying" ? "上次扫描中断：分析进程接连被系统结束，多半是 NAS 内存不够或处理器太老。" : status.error ? `上次扫描出错：${status.error}` : warning;
       $("failures").hidden = status.failedCount === 0;
       $("failures-title").textContent = `有 ${status.failedCount} 首没分析成功`;
     }

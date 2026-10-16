@@ -24,6 +24,7 @@ class PanelState:
             "lastExported": None,
             "nextScanAt": None,
             "error": None,
+            "warning": None,
         }
 
     def snapshot(self):
@@ -35,18 +36,18 @@ class PanelState:
             self._values.update(
                 state="scanning", done=0, total=0,
                 startedAt=datetime.now(timezone.utc).isoformat(),
-                nextScanAt=None, error=None,
+                nextScanAt=None, error=None, warning=None,
             )
 
     def set_progress(self, done, total):
         with self._lock:
             self._values.update(done=done, total=total)
 
-    def finish_scan(self, analyzed, exported):
+    def finish_scan(self, analyzed, exported, warning=None):
         with self._lock:
             self._values.update(
                 state="idle", finishedAt=datetime.now(timezone.utc).isoformat(),
-                lastAnalyzed=analyzed, lastExported=exported, error=None,
+                lastAnalyzed=analyzed, lastExported=exported, error=None, warning=warning,
             )
 
     def fail_scan(self, exception):

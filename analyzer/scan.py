@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, TimeoutError, wait
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import closing
@@ -130,11 +131,14 @@ def scan(music, data, out, workers=2, progress=None, analyze=None):
         paths = set()
         pending = []
         retry_died_count = 0
-        for directory, directories, filenames in os.walk(music):
+        other_suffixes = Counter()
+        walk_errors = []
+        for directory, directories, filenames in os.walk(music, onerror=walk_errors.append):
             directories[:] = sorted(name for name in directories if not name.startswith("."))
             for filename in sorted(filenames):
                 path = Path(directory) / filename
                 if path.suffix.lower() not in AUDIO_EXTENSIONS:
+                    other_suffixes[path.suffix.lower() or "(无后缀)"] += 1
                     continue
                 relative = path.relative_to(music).as_posix()
                 paths.add(relative)
@@ -150,6 +154,8 @@ def scan(music, data, out, workers=2, progress=None, analyze=None):
                 if previous is not None and previous["error"] == "WorkerDied":
                     retry_died_count += 1
 
+        for error in walk_errors:
+            LOGGER.error("WALK-ERROR %s %s", getattr(error, "filename", ""), type(error).__name__)
         for removed in cached.keys() - paths:
             connection.execute("DELETE FROM tracks WHERE path = ?", (removed,))
         retry_version_path.write_text(version + "\n", encoding="utf-8")
@@ -271,6 +277,9 @@ def scan(music, data, out, workers=2, progress=None, analyze=None):
                 finally:
                     executor.shutdown(wait=True, cancel_futures=True)
         connection.commit()
+        error_counts = Counter(
+            row["error"] for row in connection.execute("SELECT error FROM tracks WHERE error IS NOT NULL AND error != ''")
+        )
         tracks = [
             {
                 "path": row["path"],
@@ -286,7 +295,21 @@ def scan(music, data, out, workers=2, progress=None, analyze=None):
     vectors, neighbors = build_similarity(tracks)
     write_output(out, tracks, vectors, neighbors)
     LOGGER.info(
-        "SCAN-END analyzed=%s ok=%s failed=%s seconds=%.2f",
-        len(pending), done - failed, failed, time.monotonic() - started,
+        "SCAN-END analyzed=%s ok=%s failed=%s audio=%s exported=%s seconds=%.2f",
+        len(pending), done - failed, failed, len(paths), len(tracks), time.monotonic() - started,
     )
-    return {"analyzed": len(pending), "tracks": len(tracks)}
+    warning = None
+    if not tracks:
+        if not paths:
+            warning = "no_audio"
+            LOGGER.warning(
+                "EMPTY-OUTPUT reason=no_audio music_exists=%s walk_errors=%s other_files=%s",
+                music.exists(), len(walk_errors), dict(other_suffixes.most_common(6)),
+            )
+        else:
+            warning = "all_failed"
+            LOGGER.warning(
+                "EMPTY-OUTPUT reason=all_failed audio=%s errors=%s",
+                len(paths), dict(error_counts.most_common(4)),
+            )
+    return {"analyzed": len(pending), "tracks": len(tracks), "warning": warning}

@@ -68,18 +68,18 @@ def test_cache_skips_unchanged_and_reanalyzes_mtime_change(tmp_path):
     hidden.mkdir()
     write_sine(hidden / "ignored.wav")
     data, out = tmp_path / "data", tmp_path / "out"
-    assert scan(music, data, out, workers=2) == {"analyzed": 1, "tracks": 1}
-    assert scan(music, data, out, workers=2) == {"analyzed": 0, "tracks": 1}
+    assert scan(music, data, out, workers=2) == {"analyzed": 1, "tracks": 1, "warning": None}
+    assert scan(music, data, out, workers=2) == {"analyzed": 0, "tracks": 1, "warning": None}
     stat = path.stat()
     os.utime(path, (stat.st_atime, stat.st_mtime + 2))
-    assert scan(music, data, out, workers=2) == {"analyzed": 1, "tracks": 1}
+    assert scan(music, data, out, workers=2) == {"analyzed": 1, "tracks": 1, "warning": None}
     with sqlite3.connect(data / "cache.sqlite") as connection:
         row = connection.execute(
             "SELECT path, size, mtime, version, error FROM tracks"
         ).fetchone()
     assert row == ("song.WAV", path.stat().st_size, path.stat().st_mtime, ANALYZER_VERSION, None)
     path.unlink()
-    assert scan(music, data, out, workers=2) == {"analyzed": 0, "tracks": 0}
+    assert scan(music, data, out, workers=2) == {"analyzed": 0, "tracks": 0, "warning": "no_audio"}
 
 
 def test_output_schema_vectors_and_neighbors(tmp_path):
@@ -332,7 +332,7 @@ def test_scan_reports_initial_and_completed_progress(tmp_path):
         music, tmp_path / "data", tmp_path / "out", workers=2,
         progress=lambda done, total: updates.append((done, total)),
     )
-    assert result == {"analyzed": 2, "tracks": 2}
+    assert result == {"analyzed": 2, "tracks": 2, "warning": None}
     assert updates[0] == (0, 2)
     assert updates[-1] == (2, 2)
     assert updates == [(0, 2), (1, 2), (2, 2)]
@@ -1678,13 +1678,13 @@ def test_scan_isolates_worker_death_and_does_not_retry_it(tmp_path):
         music, data, out, workers=2, analyze=_analyze_or_die,
         progress=lambda done, total: updates.append((done, total)),
     )
-    assert result == {"analyzed": 5, "tracks": 4}
+    assert result == {"analyzed": 5, "tracks": 4, "warning": None}
     with sqlite3.connect(data / "cache.sqlite") as connection:
         rows = dict(connection.execute("SELECT path, error FROM tracks"))
     assert rows == {"KILL.wav": "WorkerDied", **{f"song-{index}.wav": None for index in range(4)}}
     assert "BrokenProcessPool" not in rows.values()
     assert updates[-1] == (5, 5)
-    assert scan(music, data, out, workers=2, analyze=_analyze_or_die) == {"analyzed": 0, "tracks": 4}
+    assert scan(music, data, out, workers=2, analyze=_analyze_or_die) == {"analyzed": 0, "tracks": 4, "warning": None}
 
 
 def test_scan_retries_cached_broken_process_pool(tmp_path):
@@ -1693,14 +1693,14 @@ def test_scan_retries_cached_broken_process_pool(tmp_path):
     for index in range(2):
         write_sine(music / f"song-{index}.wav")
     data, out = tmp_path / "data", tmp_path / "out"
-    assert scan(music, data, out, workers=2) == {"analyzed": 2, "tracks": 2}
+    assert scan(music, data, out, workers=2) == {"analyzed": 2, "tracks": 2, "warning": None}
     with sqlite3.connect(data / "cache.sqlite") as connection:
         connection.execute(
             "UPDATE tracks SET error = ?, features = NULL, tags = NULL WHERE path = ?",
             ("BrokenProcessPool", "song-0.wav"),
         )
         connection.commit()
-    assert scan(music, data, out, workers=2) == {"analyzed": 1, "tracks": 2}
+    assert scan(music, data, out, workers=2) == {"analyzed": 1, "tracks": 2, "warning": None}
     with sqlite3.connect(data / "cache.sqlite") as connection:
         error, features, tags = connection.execute(
             "SELECT error, features, tags FROM tracks WHERE path = ?", ("song-0.wav",),
@@ -1812,7 +1812,7 @@ def test_scan_logs_pool_failure_and_confirmed_worker_death(tmp_path, caplog):
     write_sine(music / "song.wav")
     write_sine(music / "KILL.wav")
     result = scan(music, tmp_path / "data", tmp_path / "out", workers=2, analyze=_analyze_or_die)
-    assert result == {"analyzed": 2, "tracks": 1}
+    assert result == {"analyzed": 2, "tracks": 1, "warning": None}
     messages = [record.getMessage() for record in caplog.records if record.name == "xiyue"]
     for event in ("SCAN-START", "POOL-BROKEN", "WORKER-DIED", "SCAN-END"):
         assert any(message.startswith(event) for message in messages)
@@ -1988,13 +1988,13 @@ def test_worker_died_is_retried_once_after_version_change(tmp_path, monkeypatch)
             "year": None, "lyricsLanguage": None,
         }
 
-    assert scan(music, data, out, analyze=analyze) == {"analyzed": 0, "tracks": 0}
+    assert scan(music, data, out, analyze=analyze) == {"analyzed": 0, "tracks": 0, "warning": "all_failed"}
     assert calls == []
     monkeypatch.setenv("TASTE_VERSION", version + "-next")
-    assert scan(music, data, out, analyze=analyze) == {"analyzed": 1, "tracks": 1}
+    assert scan(music, data, out, analyze=analyze) == {"analyzed": 1, "tracks": 1, "warning": None}
     assert calls == [str(path)]
     assert marker.read_text(encoding="utf-8") == version + "-next\n"
-    assert scan(music, data, out, analyze=analyze) == {"analyzed": 0, "tracks": 1}
+    assert scan(music, data, out, analyze=analyze) == {"analyzed": 0, "tracks": 1, "warning": None}
     assert calls == [str(path)]
 
 
@@ -2118,3 +2118,35 @@ def test_settings_test_reports_truncated(tmp_path):
     assert settings.test() == {"ok": False, "error": "truncated", "detail": ""}
     assert len(calls) == 1
     assert calls[0]["max_tokens"] == 200
+
+
+def test_scan_warns_when_music_folder_has_no_audio(tmp_path, caplog):
+    music = tmp_path / "music"
+    music.mkdir()
+    (music / "cover.jpg").write_bytes(b"x")
+    with caplog.at_level("WARNING", logger="xiyue"):
+        result = scan(music, tmp_path / "data", tmp_path / "out", workers=1)
+    assert result == {"analyzed": 0, "tracks": 0, "warning": "no_audio"}
+    assert any("EMPTY-OUTPUT reason=no_audio" in message and ".jpg" in message for message in caplog.messages)
+
+
+def _always_fail(path):
+    raise ValueError("bad")
+
+
+def test_scan_warns_when_every_track_fails(tmp_path, caplog):
+    music = tmp_path / "music"
+    music.mkdir()
+    write_sine(music / "a.wav")
+    with caplog.at_level("WARNING", logger="xiyue"):
+        result = scan(music, tmp_path / "data", tmp_path / "out", workers=1, analyze=_always_fail)
+    assert result["warning"] == "all_failed"
+    assert any("EMPTY-OUTPUT reason=all_failed" in message and "ValueError" in message for message in caplog.messages)
+
+
+def test_panel_state_keeps_empty_output_warning_until_next_scan():
+    state = PanelState()
+    state.finish_scan(0, 0, "no_audio")
+    assert state.snapshot()["warning"] == "no_audio"
+    state.begin_scan()
+    assert state.snapshot()["warning"] is None

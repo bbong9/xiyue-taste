@@ -187,7 +187,7 @@ def main():
                 state.fail_scan(exception)
                 LOGGER.exception("SCAN-ABORT %s", type(exception).__name__)
             else:
-                state.finish_scan(result["analyzed"], result["tracks"])
+                state.finish_scan(result["analyzed"], result["tracks"], result.get("warning"))
             _measure_loudness(args)
             summary = state.snapshot()
             LOGGER.info(
