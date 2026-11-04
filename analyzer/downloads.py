@@ -145,6 +145,8 @@ def _directory(value):
     directory = _text(value, 300)
     if not directory:
         return ""
+    if directory == ".xiyue-staging" or directory.startswith(".xiyue-staging/"):
+        raise DownloadError("outside")
     parts = directory.split("/")
     if len(parts) > 6 or "\\" in directory or any(
         not part or part != part.strip() or part.startswith(".") for part in parts
@@ -183,6 +185,7 @@ class Downloads:
 
     def __init__(self, root, allow_private=False, on_done=None):
         self._root = Path(root)
+        self._staging = self._root / ".xiyue-staging"
         self._check = _check_shape if allow_private else check_public
         self._on_done = on_done
         self._lock = threading.Lock()
@@ -191,7 +194,26 @@ class Downloads:
         self._waiting = deque()
         self._owner = None
         self._owner_checked_at = None
+        self._clean_staging()
         threading.Thread(target=self._work, daemon=True).start()
+
+    def _clean_staging(self):
+        if self._staging.is_symlink():
+            return
+        try:
+            with os.scandir(self._staging) as entries:
+                cutoff = time.time() - 24 * 60 * 60
+                for entry in entries:
+                    if not entry.name.startswith(".xiyue-part-"):
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                            os.unlink(entry.path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
     def available(self):
         return self._root.is_dir() and os.access(self._root, os.W_OK)
@@ -353,6 +375,10 @@ class Downloads:
     def _fetch(self, job):
         self._check(job["url"])
         directory = self._root / job["directory"]
+        resolved = directory.resolve()
+        if (not resolved.is_relative_to(self._root.resolve())
+                or resolved.is_relative_to(self._staging.resolve())):
+            raise DownloadError("outside")
         made, current = [], directory
         while current != self._root and not current.exists():
             made.append(current)
@@ -363,12 +389,17 @@ class Downloads:
         directory.mkdir(parents=True, exist_ok=True)
         for folder in made:
             self._own(folder, folder=True)
+        if self._staging.is_symlink():
+            raise DownloadError("outside")
+        self._staging.mkdir(exist_ok=True)
+        self._own(self._staging, folder=True)
         # Named like the song so the format is recognised by more than its first bytes.
-        part = directory / f".xiyue-part-{job['id']}.{job['filename'].rsplit('.', 1)[-1].lower()}"
+        part = self._staging / f".xiyue-part-{job['id']}.{job['filename'].rsplit('.', 1)[-1].lower()}"
         headers = {"User-Agent": job["userAgent"] or USER_AGENT}
         if job["referer"]:
             headers["Referer"] = job["referer"]
         opener = urllib.request.build_opener(_Guard(self._check))
+        temporary = []
         try:
             with opener.open(urllib.request.Request(job["url"], headers=headers), timeout=30) as response:
                 try:
@@ -377,12 +408,13 @@ class Downloads:
                     total = 0
                 if total > MAX_AUDIO_BYTES:
                     raise DownloadError("too_large")
-                if shutil.disk_usage(directory).free < total + SPARE_BYTES:
+                if shutil.disk_usage(self._staging).free < total + SPARE_BYTES:
                     raise DownloadError("no_space")
                 with self._lock:
                     job["total"] = total
                 received = 0
-                with open(part, "wb") as file:
+                with open(part, "xb") as file:
+                    temporary.append(part)
                     while True:
                         chunk = response.read(262144)
                         if not chunk:
@@ -411,6 +443,8 @@ class Downloads:
                 except Exception as error:
                     LOGGER.warning("LOUD-DOWNLOAD-FAIL %s %s", job["filename"], loudness._reason(error))
             with self._lock:
+                if job["cancelled"]:
+                    raise DownloadError("cancelled")
                 job.update(facts)
                 if written_gains is not None:
                     job.update(trackGain=written_gains["track_gain"], trackPeak=written_gains["track_peak"])
@@ -426,21 +460,33 @@ class Downloads:
                 final = directory / f"{stem} ({number}).{suffix}"
             else:
                 raise DownloadError("name_taken")
+            sidecars = []
+            if job["lyrics"] and job["lyrics"].strip():
+                sidecars.append((final.with_suffix(".lrc"), job["lyrics"].strip().encode("utf-8")))
+            if job["cover"]:
+                sidecars.append((final.with_suffix(_cover_suffix(job["cover"])), job["cover"]))
+            for path, data in sidecars:
+                try:
+                    if path.is_symlink():
+                        continue
+                    staged = self._staging / f".xiyue-part-{job['id']}{path.suffix}"
+                    with open(staged, "xb") as file:
+                        temporary.append(staged)
+                        file.write(data)
+                    self._own(staged)
+                    if not path.is_symlink():
+                        os.replace(staged, path)
+                except OSError:
+                    pass
+            with self._lock:
+                if job["cancelled"]:
+                    raise DownloadError("cancelled")
+            self._own(part)
             os.replace(part, final)
         finally:
-            part.unlink(missing_ok=True)
-        self._own(final)
-        sidecars = []
-        if job["lyrics"] and job["lyrics"].strip():
-            sidecars.append((final.with_suffix(".lrc"), job["lyrics"].strip().encode("utf-8")))
-        if job["cover"]:
-            sidecars.append((final.with_suffix(_cover_suffix(job["cover"])), job["cover"]))
-        for path, data in sidecars:
-            try:
-                if path.is_symlink():
-                    continue
-                path.write_bytes(data)
-                self._own(path)
-            except OSError:
-                pass
+            for temporary_path in temporary:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         return str(final.relative_to(self._root))

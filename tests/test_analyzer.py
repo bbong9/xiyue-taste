@@ -949,6 +949,229 @@ def _wait_for(downloads, job_id):
     raise AssertionError("download did not finish")
 
 
+def test_download_survives_a_watcher_moving_target_directory_parts(tmp_path, monkeypatch):
+    library = tmp_path / "library"
+    target = library / "downloads"
+    moved = tmp_path / "moved"
+    target.mkdir(parents=True)
+    moved.mkdir()
+    observed = []
+    measured = []
+
+    def measure(path):
+        measured.append(path)
+        for part in target.glob(".xiyue-part-*"):
+            observed.append(part.name)
+            part.rename(moved / part.name)
+        return {"track_gain": 2.5, "track_peak": 0.9}
+
+    monkeypatch.setattr(loudness, "measure_audio", measure)
+    monkeypatch.setattr(loudness, "write_tags", lambda *args, **kwargs: None)
+    server, base = _file_server({"/song": (200, _AUDIO)})
+    try:
+        downloads = Downloads(library, allow_private=True)
+        job = _wait_for(downloads, downloads.submit({
+            "url": base + "/song", "filename": "song.flac", "directory": "downloads",
+        }))
+        assert job["state"] == "done", job
+        assert observed == []
+        assert len(measured) == 1 and measured[0].parent == library / ".xiyue-staging"
+        assert (target / "song.flac").read_bytes() == _AUDIO
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_places_sidecars_before_audio_from_staging(tmp_path, monkeypatch):
+    from analyzer import downloads as module
+
+    library = tmp_path / "library"
+    target = library / "downloads"
+    target.mkdir(parents=True)
+    staging = library / ".xiyue-staging"
+    cover = b"\xff\xd8\xff" + bytes(10)
+    moves, disk_checks, ownership = [], [], []
+    original_replace = os.replace
+    original_disk_usage = module.shutil.disk_usage
+
+    def replace(source, destination):
+        source, destination = Path(source), Path(destination)
+        moves.append((source, destination, (target / "song.lrc").exists(), (target / "song.jpg").exists()))
+        return original_replace(source, destination)
+
+    def disk_usage(path):
+        disk_checks.append(path)
+        return original_disk_usage(path)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(module.shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(loudness, "measure_audio", lambda _: {"track_gain": 1.0, "track_peak": 0.9})
+    monkeypatch.setattr(loudness, "write_tags", lambda *args, **kwargs: None)
+    server, base = _file_server({"/song": (200, _AUDIO)})
+    try:
+        downloads = Downloads(library, allow_private=True)
+        original_own = downloads._own
+
+        def own(path, folder=False):
+            ownership.append((path, folder))
+            return original_own(path, folder=folder)
+
+        monkeypatch.setattr(downloads, "_own", own)
+        job = _wait_for(downloads, downloads.submit({
+            "url": base + "/song", "filename": "song.flac", "directory": "downloads",
+            "lyrics": "[00:01.00]words", "cover": base64.b64encode(cover).decode("ascii"),
+        }))
+        assert job["state"] == "done"
+        assert [destination.name for _, destination, _, _ in moves] == ["song.lrc", "song.jpg", "song.flac"]
+        assert all(source.parent == staging for source, _, _, _ in moves)
+        assert moves[-1][2:] == (True, True)
+        assert disk_checks == [staging]
+        assert (staging, True) in ownership
+        assert (target / "song.lrc").read_text() == "[00:01.00]words"
+        assert (target / "song.jpg").read_bytes() == cover
+        assert list(staging.iterdir()) == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("failed_suffix", [".lrc", ".flac"])
+def test_download_cleans_staging_when_a_move_fails(tmp_path, monkeypatch, failed_suffix):
+    staging = tmp_path / ".xiyue-staging"
+    original_replace = os.replace
+
+    def replace(source, destination):
+        if Path(destination).suffix == failed_suffix:
+            raise OSError("simulated move failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(loudness, "measure_audio", lambda _: {"track_gain": 1.0, "track_peak": 0.9})
+    monkeypatch.setattr(loudness, "write_tags", lambda *args, **kwargs: None)
+    server, base = _file_server({"/song": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        job = _wait_for(downloads, downloads.submit({
+            "url": base + "/song", "filename": "song.flac", "lyrics": "words",
+        }))
+        assert job["state"] == ("done" if failed_suffix == ".lrc" else "failed")
+        if failed_suffix == ".flac":
+            assert job["error"] == "io_failed"
+        assert (tmp_path / "song.flac").exists() == (failed_suffix == ".lrc")
+        assert (tmp_path / "song.lrc").exists() == (failed_suffix != ".lrc")
+        assert list(staging.iterdir()) == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_cancellation_during_loudness_cleans_staging(tmp_path, monkeypatch):
+    started, finish = threading.Event(), threading.Event()
+
+    def measure(path):
+        started.set()
+        finish.wait(5)
+        return {"track_gain": 1.0, "track_peak": 0.9}
+
+    monkeypatch.setattr(loudness, "measure_audio", measure)
+    monkeypatch.setattr(loudness, "write_tags", lambda *args, **kwargs: None)
+    server, base = _file_server({"/song": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        job_id = downloads.submit({"url": base + "/song", "filename": "song.flac", "lyrics": "words"})
+        assert started.wait(5)
+        assert downloads.cancel(job_id)
+        finish.set()
+        job = _wait_for(downloads, job_id)
+        assert job["state"] == "cancelled"
+        assert list((tmp_path / ".xiyue-staging").iterdir()) == []
+        assert not (tmp_path / "song.flac").exists()
+        assert not (tmp_path / "song.lrc").exists()
+    finally:
+        finish.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_startup_cleans_only_old_regular_staging_parts(tmp_path, monkeypatch):
+    from analyzer import downloads as module
+
+    staging = tmp_path / ".xiyue-staging"
+    staging.mkdir()
+    now = time.time()
+    old = staging / ".xiyue-part-old.flac"
+    recent = staging / ".xiyue-part-recent.flac"
+    boundary = staging / ".xiyue-part-boundary.lrc"
+    other = staging / "other.flac"
+    for path in (old, recent, boundary, other):
+        path.write_bytes(b"data")
+    os.utime(old, (now, now - 86401))
+    os.utime(recent, (now, now - 3600))
+    os.utime(boundary, (now, now - 86400))
+    os.utime(other, (now, now - 86401))
+    nested = staging / ".xiyue-part-folder"
+    nested.mkdir()
+    (nested / ".xiyue-part-old.flac").write_bytes(b"nested")
+    outside = tmp_path / "outside.flac"
+    outside.write_bytes(b"outside")
+    os.utime(outside, (now, now - 86401))
+    link = staging / ".xiyue-part-link.flac"
+    link.symlink_to(outside)
+    monkeypatch.setattr(module, "time", SimpleNamespace(time=lambda: now, monotonic=time.monotonic))
+
+    Downloads(tmp_path)
+
+    assert not old.exists()
+    assert recent.exists() and boundary.exists() and other.exists()
+    assert (nested / ".xiyue-part-old.flac").read_bytes() == b"nested"
+    assert link.is_symlink() and outside.read_bytes() == b"outside"
+
+
+def test_download_does_not_follow_staging_symlink_or_clean_its_target(tmp_path):
+    library = tmp_path / "library"
+    library.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    old = outside / ".xiyue-part-old.flac"
+    old.write_bytes(b"outside")
+    os.utime(old, (time.time() - 86401, time.time() - 86401))
+    (library / ".xiyue-staging").symlink_to(outside, target_is_directory=True)
+    server, base = _file_server({"/song": (200, _AUDIO)})
+    try:
+        downloads = Downloads(library, allow_private=True)
+        assert old.read_bytes() == b"outside"
+        job = _wait_for(downloads, downloads.submit({"url": base + "/song", "filename": "song.flac"}))
+        assert (job["state"], job["error"]) == ("failed", "outside")
+        assert list(outside.iterdir()) == [old]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_download_rejects_staging_destinations_and_locate_ignores_staging(tmp_path):
+    staging = tmp_path / ".xiyue-staging"
+    staging.mkdir()
+    (tmp_path / "linked").symlink_to(staging, target_is_directory=True)
+    name = ".xiyue-probe-" + "a" * 32
+    (staging / name).write_text("")
+    server, base = _file_server({"/song": (200, _AUDIO)})
+    try:
+        downloads = Downloads(tmp_path, allow_private=True)
+        with pytest.raises(DownloadError, match="not_found"):
+            downloads.locate(name)
+        body = {"url": base + "/song", "filename": "song.flac"}
+        for directory in (".xiyue-staging", ".xiyue-staging/child"):
+            with pytest.raises(DownloadError, match="outside"):
+                downloads.submit({**body, "directory": directory})
+        for directory in ("linked", "linked/child"):
+            job = _wait_for(downloads, downloads.submit({**body, "directory": directory}))
+            assert (job["state"], job["error"]) == ("failed", "outside")
+        assert sorted(path.name for path in staging.iterdir()) == [name]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 @pytest.mark.parametrize("outcome", ["tagged", "measure_failed", "write_failed", "unsupported"])
 def test_download_snapshot_returns_only_written_loudness(tmp_path, monkeypatch, outcome):
     from analyzer import downloads as download_module, loudness
