@@ -21,6 +21,9 @@ from .scan import AUDIO_EXTENSIONS, probe_worker, scan
 from .serve import make_server
 from .settings import LLMSettings
 from .sources import SourceStore
+from .vault import ButlerVaultStore
+from .butler_files import ButlerFileOps
+from .butler_upgrade import ButlerUpgrader
 
 
 def _run_sources(runner, sources):
@@ -168,11 +171,16 @@ def main():
         runner.on_alert = sources.note_alert
         threading.Thread(target=_run_sources, args=(runner, sources), name="sources", daemon=True).start()
         loudness_service = loudness.Loudness(args.downloads, args.data, args.out, args.music)
+        vault_store = ButlerVaultStore(args.data)
+        butler_files = ButlerFileOps(args.downloads)
+        butler_upgrade = ButlerUpgrader(
+            butler_files, args.data, resolver=resolver, on_done=loudness_service.request_measure,
+        )
         server = make_server(
             args.out, args.port, data=args.data, state=state, index=index, asker=asker, butler=butler, llm=llm,
             downloads=Downloads(args.downloads, on_done=loudness_service.request_measure),
             access=access, sources=sources, resolver=resolver, accounts=accounts, personal=personal,
-            loudness=loudness_service,
+            loudness=loudness_service, vault=vault_store, butler_files=butler_files, butler_upgrade=butler_upgrade,
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
         LOGGER.info("Serving on port %s.", args.port)

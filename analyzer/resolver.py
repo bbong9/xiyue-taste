@@ -557,6 +557,12 @@ class Resolver:
             answer.update(path=f"/api/source/stream/{ticket}", expiresAt=int(expires))
         return answer
 
+    def resolve_nas(self, body, account):
+        """Resolves an upstream download URL directly for NAS-side operations (e.g. butler upgrade)."""
+        request = _request(body, purpose="download")
+        found, _ = self._logged(request, account, "nas")
+        return {"url": found.url, "quality": found.quality, "sourceName": found.source_name}
+
     def download(self, body, account, downloads):
         """POST /api/source/download: resolves for a download and hands the address to the NAS's queue."""
         if downloads is None or not downloads.available():

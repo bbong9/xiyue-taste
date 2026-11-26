@@ -20,10 +20,14 @@ from .personal import PersonalError
 from .resolver import FAMILY_DEFAULTS, OWNER, ResolveError
 from .settings import SettingsError
 from .sources import SourceError
+from .vault import ButlerVaultError
+from .butler_files import ButlerFileError
+from .butler_upgrade import ButlerUpgradeError
 
 
 _SOURCE_ITEM = re.compile(r"/api/sources/([0-9a-f]{16})(/test|/replace|/refresh|/rollback)?")
 _ACCOUNT_ITEM = re.compile(r"/api/accounts/(owner|[0-9a-f]{16})(?:/devices/([0-9a-f]{16}))?")
+_VAULT_BLOB = re.compile(r"/api/butler/vault/blob/(photos|covers|avatars|lyrics)/([0-9a-f]{32})")
 _DISABLED = object()
 _STREAM_PREFIX = "/api/source/stream/"
 _auth_rejections = {}
@@ -58,7 +62,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def __init__(
         self, *args, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-        access=None, sources=None, resolver=None, accounts=None, personal=None, loudness=None, **kwargs,
+        access=None, sources=None, resolver=None, accounts=None, personal=None, loudness=None, vault=None,
+        butler_files=None, butler_upgrade=None, **kwargs,
     ):
         self._data = data
         self._state = state
@@ -73,6 +78,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self._accounts = accounts
         self._personal = personal
         self._loudness = loudness
+        self._vault = vault
+        self._butler_files = butler_files
+        self._butler_upgrade = butler_upgrade
         super().__init__(*args, **kwargs)
 
     def parse_request(self):
@@ -182,6 +190,135 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         LOGGER.warning("SOURCE-PANEL rejected addr=%s", self.client_address[0])
         self._send_json({"error": "home_only"}, 403)
         return False
+
+    def _get_vault(self, url):
+        if self._vault is None:
+            self._send_json({"error": "vault_unconfigured"}, 503)
+            return
+        if url.path == "/api/butler/vault":
+            query = parse_qs(url.query, keep_blank_values=True)
+            since = None
+            if "since" in query and query["since"] and query["since"][0] != "":
+                try:
+                    since = int(query["since"][0])
+                except ValueError:
+                    self._send_json({"error": "bad_request"}, 400)
+                    return
+            self._send_json(self._vault.manifest(since=since))
+            return
+        match = _VAULT_BLOB.fullmatch(url.path)
+        if match is None:
+            self._send_json({"error": "not_found"}, 404)
+            return
+        try:
+            payload, content_type, etag = self._vault.read_blob(match.group(1), match.group(2))
+        except ButlerVaultError as error:
+            self._send_json({"error": error.code}, error.status)
+            return
+        quoted_etag = f'"{etag}"'
+        if self.headers.get("If-None-Match", "").strip() in (etag, quoted_etag):
+            self.send_response(304)
+            self.send_header("ETag", quoted_etag)
+            self.send_header("Cache-Control", "private, max-age=86400")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("ETag", quoted_etag)
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _post_vault(self, path):
+        if self._vault is None:
+            self._send_json({"error": "vault_unconfigured"}, 503)
+            return
+        try:
+            if path == "/api/butler/vault/items":
+                body = self._read_json(16 * 1024 * 1024)
+                if body is not None:
+                    self._send_json(self._vault.upsert(body))
+            elif path == "/api/butler/vault/delete":
+                body = self._read_json(512 * 1024)
+                if body is not None:
+                    self._send_json(self._vault.delete(body))
+            elif path == "/api/butler/vault/lyrics/batch":
+                body = self._read_json(256 * 1024)
+                if body is not None:
+                    self._send_json(self._vault.read_lyrics_batch(body.get("trackIDs")))
+            else:
+                self._send_json({"error": "not_found"}, 404)
+        except ButlerVaultError as error:
+            self._send_json({"error": error.code}, error.status)
+
+    def _get_butler_files(self, path):
+        if not self._owner_only():
+            return
+        if self._butler_files is None:
+            self._send_json({"error": "files_unconfigured"}, 503)
+            return
+        try:
+            if path == "/api/butler/files/status":
+                self._send_json(self._butler_files.status())
+            elif path == "/api/butler/files/trash":
+                self._send_json(self._butler_files.list_trash())
+            else:
+                self._send_json({"error": "not_found"}, 404)
+        except ButlerFileError as error:
+            self._send_json({"error": error.code}, error.status)
+
+    def _post_butler_files(self, path):
+        if not self._owner_only():
+            return
+        if self._butler_files is None:
+            self._send_json({"error": "files_unconfigured"}, 503)
+            return
+        body = self._read_json(4 * 1024 * 1024)
+        if body is None:
+            return
+        try:
+            if path == "/api/butler/files/resolve":
+                self._send_json(self._butler_files.resolve_batch(body.get("paths")))
+            elif path == "/api/butler/files/trash":
+                self._send_json(self._butler_files.trash(body))
+            elif path == "/api/butler/files/restore":
+                self._send_json(self._butler_files.restore(body))
+            elif path == "/api/butler/files/purge":
+                self._send_json(self._butler_files.purge(body))
+            else:
+                self._send_json({"error": "not_found"}, 404)
+        except ButlerFileError as error:
+            self._send_json({"error": error.code}, error.status)
+
+    def _get_butler_upgrade(self, path):
+        if not self._owner_only():
+            return
+        if self._butler_upgrade is None:
+            self._send_json({"error": "upgrade_unconfigured"}, 503)
+            return
+        if path == "/api/butler/upgrade/status":
+            self._send_json(self._butler_upgrade.snapshot())
+        else:
+            self._send_json({"error": "not_found"}, 404)
+
+    def _post_butler_upgrade(self, path):
+        if not self._owner_only():
+            return
+        if self._butler_upgrade is None:
+            self._send_json({"error": "upgrade_unconfigured"}, 503)
+            return
+        try:
+            if path == "/api/butler/upgrade/start":
+                body = self._read_json(4 * 1024 * 1024)
+                if body is not None:
+                    self._send_json(self._butler_upgrade.start(body), 202)
+            elif path == "/api/butler/upgrade/cancel":
+                self._send_json(self._butler_upgrade.cancel())
+            else:
+                self._send_json({"error": "not_found"}, 404)
+        except ButlerUpgradeError as error:
+            self._send_json({"error": error.code}, error.status)
 
     def _loudness_available(self):
         if not self._owner_only():
@@ -471,6 +608,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         elif url.path == "/api/loudness":
             if self._loudness_available():
                 self._send_json(self._loudness.snapshot())
+        elif url.path == "/api/butler/vault" or url.path.startswith("/api/butler/vault/"):
+            self._get_vault(url)
+        elif url.path.startswith("/api/butler/files/"):
+            self._get_butler_files(url.path)
+        elif url.path.startswith("/api/butler/upgrade/"):
+            self._get_butler_upgrade(url.path)
         elif url.path.startswith("/api/"):
             if not self._panel_available():
                 self._send_json({"error": "not_found"}, 404)
@@ -533,7 +676,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if path not in ("/", "/index.html", "/api/account/login") and not self._authorized():
             self._reject_auth()
             return
-        if path in ("/api/llm", "/api/llm/test", "/api/scan", "/api/butler/artists", "/api/butler/songs") and not self._owner_only():
+        if path in (
+            "/api/llm", "/api/llm/test", "/api/scan", "/api/butler/artists", "/api/butler/songs",
+            "/api/butler/vault/items", "/api/butler/vault/delete",
+        ) and not self._owner_only():
             return
         path = urlsplit(self.path).path
         if path.startswith("/api/"):
@@ -541,6 +687,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._post_account(path)
             elif path in ("/api/loudness/scan", "/api/loudness/write"):
                 self._post_loudness(path)
+            elif path.startswith("/api/butler/vault/"):
+                self._post_vault(path)
+            elif path.startswith("/api/butler/files/"):
+                self._post_butler_files(path)
+            elif path.startswith("/api/butler/upgrade/"):
+                self._post_butler_upgrade(path)
             elif path == "/api/access":
                 if not self._owner_only():
                     return
@@ -696,7 +848,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
 def make_server(
     out, port, data=None, state=None, index=None, asker=None, butler=None, llm=None, downloads=None,
-    access=None, sources=None, resolver=None, accounts=None, personal=None, loudness=None,
+    access=None, sources=None, resolver=None, accounts=None, personal=None, loudness=None, vault=None,
+    butler_files=None, butler_upgrade=None,
 ):
     if access is None:
         access = AccessSettings(None, network=ipaddress.ip_network("192.168.50.0/24"), host_ip="192.168.50.2")
@@ -704,7 +857,7 @@ def make_server(
         _Handler, directory=str(out), data=data, state=state, index=index, asker=asker, butler=butler, llm=llm,
         downloads=downloads,
         access=access, sources=sources, resolver=resolver, accounts=accounts, personal=personal,
-        loudness=loudness,
+        loudness=loudness, vault=vault, butler_files=butler_files, butler_upgrade=butler_upgrade,
     )
     return http.server.ThreadingHTTPServer(("", port), handler)
 
