@@ -252,3 +252,87 @@ def test_butler_upgrade_http_owner_only(tmp_path):
         assert status == 403 and body["error"] == "owner_only"
         status, _ = _http(port, "POST", "/api/butler/upgrade/start", {"target": "lossless", "items": []}, headers=family_headers)
         assert status == 403
+
+
+def test_butler_upgrade_per_item_and_candidate_fallback_targets(tmp_path):
+    library = tmp_path / "downloads"
+    album = library / "刀郎" / "精选"
+    album.mkdir(parents=True)
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+
+    mp3_fallback = album / "01 手心里的温柔.mp3"
+    mp3_direct_lower = album / "02 爱上一个不回家的人.mp3"
+    already_flac = album / "03 冲动的惩罚.flac"
+    _make_audio(mp3_fallback, "mp3", freq=440, duration=6, bitrate="128k")
+    _make_audio(mp3_direct_lower, "mp3", freq=440, duration=6, bitrate="128k")
+    _make_audio(already_flac, "flac", freq=440, duration=6)
+
+    good_flac = upstream / "good.flac"
+    _make_audio(good_flac, "flac", freq=440, duration=6)
+
+    files = ButlerFileOps(library)
+    upgrader = ButlerUpgrader(files, tmp_path / "data", allow_private=True)
+    owner_headers = {"Authorization": f"Bearer {OWNER_TOKEN}"}
+
+    with _file_server(upstream) as media_port, _api_server(tmp_path, files, upgrader) as api_port:
+        status, started = _http(api_port, "POST", "/api/butler/upgrade/start", {
+            "target": "master",
+            "skipsSoundChecks": False,
+            "keepOldInTrash": False,
+            "items": [
+                {
+                    # Batch target is master: master candidate fails (404), falls back cleanly to lossless!
+                    "trackId": "trk-fb",
+                    "title": "手心里的温柔",
+                    "artists": ["刀郎"],
+                    "nasPath": "/vol1/1000/Music/刀郎/精选/01 手心里的温柔.mp3",
+                    "target": "master",
+                    "candidates": [
+                        {"sourceName": "源A", "target": "master", "url": f"http://127.0.0.1:{media_port}/missing-master.flac"},
+                        {"sourceName": "源A", "target": "lossless", "url": f"http://127.0.0.1:{media_port}/good.flac"},
+                    ],
+                },
+                {
+                    # Explicit per-item effectiveTarget = lossless inside a master batch.
+                    "trackId": "trk-lower",
+                    "title": "爱上一个不回家的人",
+                    "artists": ["花花兔"],
+                    "nasPath": "/vol1/1000/Music/刀郎/精选/02 爱上一个不回家的人.mp3",
+                    "target": "lossless",
+                    "candidates": [
+                        {"sourceName": "源B", "target": "lossless", "url": f"http://127.0.0.1:{media_port}/good.flac"},
+                    ],
+                },
+                {
+                    # Already 16bit FLAC: master fails (404) and lossless fallback must NOT replace 16bit FLAC with 16bit FLAC!
+                    "trackId": "trk-already-flac",
+                    "title": "冲动的惩罚",
+                    "artists": ["刀郎"],
+                    "nasPath": "/vol1/1000/Music/刀郎/精选/03 冲动的惩罚.flac",
+                    "target": "master",
+                    "candidates": [
+                        {"sourceName": "源A", "target": "master", "url": f"http://127.0.0.1:{media_port}/missing-master.flac"},
+                        {"sourceName": "源A", "target": "lossless", "url": f"http://127.0.0.1:{media_port}/good.flac"},
+                    ],
+                },
+            ],
+        }, headers=owner_headers)
+        assert status == 202 and started["accepted"] == 3
+
+        snap = _wait_idle(api_port, owner_headers)
+        assert snap["succeeded"] == 2
+        assert snap["failed"] == 1
+        by_id = {entry["trackId"]: entry for entry in snap["items"]}
+
+        assert by_id["trk-fb"]["status"] == "replaced"
+        assert by_id["trk-fb"]["achievedTarget"] == "lossless"
+        assert not mp3_fallback.exists() and (album / "01 手心里的温柔.flac").is_file()
+
+        assert by_id["trk-lower"]["status"] == "replaced"
+        assert by_id["trk-lower"]["achievedTarget"] == "lossless"
+        assert not mp3_direct_lower.exists() and (album / "02 爱上一个不回家的人.flac").is_file()
+
+        assert by_id["trk-already-flac"]["status"] == "failed"
+        assert by_id["trk-already-flac"]["settled"] is False
+        assert already_flac.is_file()

@@ -163,3 +163,76 @@ def test_butler_files_http_owner_only(tmp_path):
         rel_trash = body["results"][0]["relativeTrash"]
         status, body = _http(port, "POST", "/api/butler/files/purge", {"paths": [rel_trash]}, headers=owner_headers)
         assert status == 200 and body["done"] == 1
+
+
+def test_butler_files_move_and_write_for_artist_consolidation(tmp_path):
+    import base64
+
+    library = tmp_path / "downloads"
+    (library / "周杰伦" / "叶惠美").mkdir(parents=True)
+    (library / "下载").mkdir(parents=True)
+    (library / "周杰伦" / "叶惠美" / "01 晴天.flac").write_bytes(b"qingtian")
+    (library / "下载" / "02 稻香.flac").write_bytes(b"daoxiang")
+    (library / "下载" / "02 稻香.lrc").write_bytes(b"[00:01.00]lrc")
+    (library / "下载" / "cover.jpg").write_bytes(b"cover-bytes")
+
+    accounts = AccountStore(tmp_path)
+    personal = PersonalStore(tmp_path)
+    accounts.create("家人", PASSWORD)
+    family_token = accounts.login("家人", PASSWORD, "iPhone")["token"]
+    owner_headers = {"Authorization": f"Bearer {OWNER_TOKEN}"}
+    family_headers = {"Authorization": f"Bearer {family_token}"}
+
+    ops = ButlerFileOps(library)
+    with _server(tmp_path, ops, accounts=accounts, personal=personal) as port:
+        status, st = _http(port, "GET", "/api/butler/files/status", headers=owner_headers)
+        assert status == 200
+        assert st["supportsMove"] is True and st["supportsWrite"] is True
+
+        # Family cannot move or write.
+        status, _ = _http(port, "POST", "/api/butler/files/move", {"items": [{"from": "下载/02 稻香.flac", "to": "周杰伦/魔杰座/02 稻香.flac"}]}, headers=family_headers)
+        assert status == 403
+        status, _ = _http(port, "POST", "/api/butler/files/write", {"items": [{"relativePath": "周杰伦/artist.jpg", "contentBase64": base64.b64encode(b"img").decode()}]}, headers=family_headers)
+        assert status == 403
+
+        # Move scattered track (with NAS prefix) into artist folder; carries .lrc & cover.jpg and removes empty folder.
+        status, moved = _http(port, "POST", "/api/butler/files/move", {
+            "items": [{
+                "from": "/vol1/1000/Music/下载/02 稻香.flac",
+                "to": "/vol1/1000/Music/周杰伦/魔杰座/02 稻香.flac",
+                "includeLyrics": True,
+            }],
+        }, headers=owner_headers)
+        assert status == 200 and moved["done"] == 1 and moved["failed"] == 0
+        res = moved["results"][0]
+        assert res["ok"] is True
+        assert res["relativeFrom"] == "下载/02 稻香.flac"
+        assert res["relativeTo"] == "周杰伦/魔杰座/02 稻香.flac"
+        assert res["lyricsTo"] == "周杰伦/魔杰座/02 稻香.lrc"
+        assert "下载" in res["removedFolders"]
+        assert (library / "周杰伦" / "魔杰座" / "02 稻香.flac").is_file()
+        assert (library / "周杰伦" / "魔杰座" / "02 稻香.lrc").is_file()
+        assert (library / "周杰伦" / "魔杰座" / "cover.jpg").is_file()
+        assert not (library / "下载").exists()
+
+        # Write artist.jpg & artist.nfo without overwriting existing files.
+        jpg_b64 = base64.b64encode(b"artist-photo-bytes").decode()
+        nfo_b64 = base64.b64encode("<artist><name>周杰伦</name></artist>".encode("utf-8")).decode()
+        status, written = _http(port, "POST", "/api/butler/files/write", {
+            "items": [
+                {"relativePath": "周杰伦/artist.jpg", "contentBase64": jpg_b64, "overwrite": False},
+                {"relativePath": "周杰伦/artist.nfo", "contentBase64": nfo_b64, "overwrite": False},
+            ],
+        }, headers=owner_headers)
+        assert status == 200 and written["done"] == 2 and written["failed"] == 0
+        assert (library / "周杰伦" / "artist.jpg").read_bytes() == b"artist-photo-bytes"
+
+        # Second write with overwrite=False skips without overwriting!
+        status, skipped = _http(port, "POST", "/api/butler/files/write", {
+            "items": [
+                {"relativePath": "周杰伦/artist.jpg", "contentBase64": base64.b64encode(b"new-bytes").decode(), "overwrite": False},
+            ],
+        }, headers=owner_headers)
+        assert status == 200 and skipped["done"] == 0
+        assert skipped["results"][0]["skipped"] is True
+        assert (library / "周杰伦" / "artist.jpg").read_bytes() == b"artist-photo-bytes"

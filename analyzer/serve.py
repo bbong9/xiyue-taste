@@ -274,7 +274,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if self._butler_files is None:
             self._send_json({"error": "files_unconfigured"}, 503)
             return
-        body = self._read_json(4 * 1024 * 1024)
+        limit = 16 * 1024 * 1024 if path == "/api/butler/files/write" else 4 * 1024 * 1024
+        body = self._read_json(limit)
         if body is None:
             return
         try:
@@ -286,6 +287,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_json(self._butler_files.restore(body))
             elif path == "/api/butler/files/purge":
                 self._send_json(self._butler_files.purge(body))
+            elif path == "/api/butler/files/move":
+                self._send_json(self._butler_files.move(body))
+            elif path == "/api/butler/files/write":
+                self._send_json(self._butler_files.write(body))
             else:
                 self._send_json({"error": "not_found"}, 404)
         except ButlerFileError as error:

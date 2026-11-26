@@ -42,7 +42,7 @@ from .log import LOGGER
 from .resolver import OWNER, ResolveError
 
 MAX_UPGRADE_ITEMS = 100
-MAX_CANDIDATES_PER_ITEM = 5
+MAX_CANDIDATES_PER_ITEM = 8
 LOSSLESS_FORMATS = {"flac", "wav", "ape"}
 TARGET_ALIASES = {
     "320k": "high",
@@ -481,6 +481,7 @@ class ButlerUpgrader:
                 or not isinstance(candidates, list) or not candidates
             ):
                 raise ButlerUpgradeError("bad_request")
+            item_target = _normalize_target(raw["target"]) if raw.get("target") is not None else target
             clean_candidates = []
             for cand in candidates[:MAX_CANDIDATES_PER_ITEM]:
                 if not isinstance(cand, dict):
@@ -493,8 +494,10 @@ class ButlerUpgrader:
                 has_resolve = isinstance(platform, str) and isinstance(quality, str) and isinstance(music_info, dict)
                 if not has_url and not has_resolve:
                     continue
+                cand_target = _normalize_target(cand["target"]) if cand.get("target") is not None else item_target
                 clean_candidates.append({
                     "sourceName": str(cand.get("sourceName") or "").strip(),
+                    "target": cand_target,
                     "url": url.strip() if has_url else "",
                     "platform": platform.strip() if isinstance(platform, str) else "",
                     "quality": quality.strip() if isinstance(quality, str) else "",
@@ -515,6 +518,7 @@ class ButlerUpgrader:
                 "discNumber": raw.get("discNumber"),
                 "year": raw.get("year"),
                 "nasPath": nas_path.strip(),
+                "target": item_target,
                 "candidates": clean_candidates,
             })
             state_items.append({
@@ -531,6 +535,7 @@ class ButlerUpgrader:
                 "oldSizeBytes": 0,
                 "newSizeBytes": 0,
                 "sourceName": "",
+                "achievedTarget": "",
                 "settled": False,
             })
 
@@ -638,7 +643,9 @@ class ButlerUpgrader:
             old_facts = {"format": old_path.suffix.lower().lstrip("."), "durationMs": 0, "sampleRate": 0, "bitDepth": 0, "bitRate": 0}
         old_summary = _describe_facts(old_facts, old_size)
 
-        if _is_target_met(old_facts, target):
+        item_target = item.get("target") or target
+        candidate_targets = [c.get("target") or item_target for c in item["candidates"]]
+        if all(_is_target_met(old_facts, t) for t in candidate_targets):
             return {
                 "status": "skipped",
                 "stage": "",
@@ -656,16 +663,25 @@ class ButlerUpgrader:
 
         temp_files = []
         try:
-            self._set_stage(index, "downloading")
-            downloaded_path = None
-            source_name = ""
+            old_dur = int(old_facts.get("durationMs") or 0)
+            old_sha = None
+            old_cut_loaded = False
+            old_cut = None
+
+            accepted = None
             last_error = "没有能下载所选音质的来源"
+            last_reject = None
 
             for cand in item["candidates"]:
                 if self._cancel_event.is_set():
                     return {"status": "cancelled", "stage": "", "oldPath": old_rel, "oldSummary": old_summary, "oldSizeBytes": old_size, "reason": "已停止", "settled": False}
+                cand_target = cand.get("target") or item_target
+                if _is_target_met(old_facts, cand_target):
+                    continue
+
+                self._set_stage(index, "downloading")
                 url = cand["url"]
-                source_name = cand["sourceName"] or source_name
+                source_name = cand["sourceName"] or ""
                 if not url and cand["musicInfo"] is not None:
                     if self._resolver is None:
                         last_error = "容器未配置音源解析器"
@@ -692,21 +708,91 @@ class ButlerUpgrader:
                 temp_files.append(part)
                 try:
                     self._download_url(url, part, cand["userAgent"], cand["referer"])
-                    downloaded_path = part
-                    break
                 except ButlerUpgradeError as err:
                     if err.code == "cancelled":
                         return {"status": "cancelled", "stage": "", "oldPath": old_rel, "oldSummary": old_summary, "oldSizeBytes": old_size, "reason": "已停止", "settled": False}
                     last_error = self._download_error_text(err.code)
                     part.unlink(missing_ok=True)
+                    continue
                 except urllib.error.HTTPError as err:
                     last_error = f"下载失败（HTTP {err.code}）"
                     part.unlink(missing_ok=True)
+                    continue
                 except (urllib.error.URLError, OSError):
                     last_error = "下载连接中断"
                     part.unlink(missing_ok=True)
+                    continue
 
-            if downloaded_path is None:
+                self._set_stage(index, "verifying")
+                try:
+                    new_facts = _facts(part)
+                except Exception:
+                    last_error = "下载到的文件不是有效音频"
+                    part.unlink(missing_ok=True)
+                    continue
+                new_size = int(part.lstat().st_size)
+                new_summary = _describe_facts(new_facts, new_size)
+
+                def _reject(reason_text: str):
+                    nonlocal last_reject
+                    last_reject = {
+                        "status": "skipped",
+                        "stage": "",
+                        "oldPath": old_rel,
+                        "oldSummary": old_summary,
+                        "newSummary": new_summary,
+                        "oldSizeBytes": old_size,
+                        "newSizeBytes": new_size,
+                        "sourceName": source_name,
+                        "reason": reason_text,
+                        "settled": True,
+                    }
+                    part.unlink(missing_ok=True)
+
+                if not _accepts_new_quality(new_facts, cand_target):
+                    _reject(f"下载到的是 {new_summary}，未达到所选音质")
+                    continue
+
+                if new_size == old_size:
+                    if old_sha is None:
+                        old_sha = _sha256_file(old_path)
+                    if _sha256_file(part) == old_sha:
+                        _reject("下载到的和原来是同一个文件")
+                        continue
+
+                new_dur = int(new_facts.get("durationMs") or 0)
+                if old_dur > 0 and new_dur > 0 and abs(new_dur - old_dur) > 10_000:
+                    _reject(f"时长相差过大（原 {old_dur // 1000}s / 新 {new_dur // 1000}s），不是同一版本")
+                    continue
+
+                corr = _same_recording_correlation(old_path, part)
+                if corr is not None and corr < 0.65:
+                    _reject(f"和原来的不像同一个录音（相似度 {round(corr * 100)}%）")
+                    continue
+
+                if not skips_sound_checks:
+                    if not old_cut_loaded:
+                        old_cut = _estimate_cutoff_hz(old_path, int(old_facts.get("sampleRate") or 0), old_dur)
+                        old_cut_loaded = True
+                    new_cut = _estimate_cutoff_hz(part, int(new_facts.get("sampleRate") or 0), new_dur)
+                    if new_cut is not None:
+                        old_is_lossy = (old_facts.get("format") or "").lower() not in LOSSLESS_FORMATS
+                        if cand_target == "lossless" and old_is_lossy:
+                            floor = max((old_cut or 0.0) + 500.0, 17500.0)
+                            if new_cut < floor:
+                                _reject(f"高频只到 {new_cut / 1000.0:.1f} kHz，像是有损转的（可开“不核对音质”跳过）")
+                                continue
+                        elif cand_target in ("hires", "master") and int(new_facts.get("sampleRate") or 0) > 48_000:
+                            if new_cut < 22500.0:
+                                _reject(f"高频只到 {new_cut / 1000.0:.1f} kHz，像是升频文件（可开“不核对音质”跳过）")
+                                continue
+
+                accepted = (part, new_facts, source_name, cand_target)
+                break
+
+            if accepted is None:
+                if last_reject is not None:
+                    return last_reject
                 return {
                     "status": "failed",
                     "stage": "",
@@ -717,116 +803,7 @@ class ButlerUpgrader:
                     "settled": False,
                 }
 
-            self._set_stage(index, "verifying")
-            try:
-                new_facts = _facts(downloaded_path)
-            except Exception:
-                return {
-                    "status": "failed",
-                    "stage": "",
-                    "oldPath": old_rel,
-                    "oldSummary": old_summary,
-                    "oldSizeBytes": old_size,
-                    "sourceName": source_name,
-                    "reason": "下载到的文件不是有效音频",
-                    "settled": False,
-                }
-            new_size = int(downloaded_path.lstat().st_size)
-            new_summary = _describe_facts(new_facts, new_size)
-
-            if not _accepts_new_quality(new_facts, target):
-                return {
-                    "status": "skipped",
-                    "stage": "",
-                    "oldPath": old_rel,
-                    "oldSummary": old_summary,
-                    "newSummary": new_summary,
-                    "oldSizeBytes": old_size,
-                    "newSizeBytes": new_size,
-                    "sourceName": source_name,
-                    "reason": f"下载到的是 {new_summary}，未达到所选音质",
-                    "settled": True,
-                }
-
-            if new_size == old_size and _sha256_file(downloaded_path) == _sha256_file(old_path):
-                return {
-                    "status": "skipped",
-                    "stage": "",
-                    "oldPath": old_rel,
-                    "oldSummary": old_summary,
-                    "newSummary": new_summary,
-                    "oldSizeBytes": old_size,
-                    "newSizeBytes": new_size,
-                    "sourceName": source_name,
-                    "reason": "下载到的和原来是同一个文件",
-                    "settled": True,
-                }
-
-            old_dur = int(old_facts.get("durationMs") or 0)
-            new_dur = int(new_facts.get("durationMs") or 0)
-            if old_dur > 0 and new_dur > 0 and abs(new_dur - old_dur) > 10_000:
-                return {
-                    "status": "skipped",
-                    "stage": "",
-                    "oldPath": old_rel,
-                    "oldSummary": old_summary,
-                    "newSummary": new_summary,
-                    "oldSizeBytes": old_size,
-                    "newSizeBytes": new_size,
-                    "sourceName": source_name,
-                    "reason": f"时长相差过大（原 {old_dur // 1000}s / 新 {new_dur // 1000}s），不是同一版本",
-                    "settled": True,
-                }
-
-            corr = _same_recording_correlation(old_path, downloaded_path)
-            if corr is not None and corr < 0.65:
-                return {
-                    "status": "skipped",
-                    "stage": "",
-                    "oldPath": old_rel,
-                    "oldSummary": old_summary,
-                    "newSummary": new_summary,
-                    "oldSizeBytes": old_size,
-                    "newSizeBytes": new_size,
-                    "sourceName": source_name,
-                    "reason": f"和原来的不像同一个录音（相似度 {round(corr * 100)}%）",
-                    "settled": True,
-                }
-
-            if not skips_sound_checks:
-                old_cut = _estimate_cutoff_hz(old_path, int(old_facts.get("sampleRate") or 0), old_dur)
-                new_cut = _estimate_cutoff_hz(downloaded_path, int(new_facts.get("sampleRate") or 0), new_dur)
-                if new_cut is not None:
-                    old_is_lossy = (old_facts.get("format") or "").lower() not in LOSSLESS_FORMATS
-                    if target == "lossless" and old_is_lossy:
-                        floor = max((old_cut or 0.0) + 500.0, 17500.0)
-                        if new_cut < floor:
-                            return {
-                                "status": "skipped",
-                                "stage": "",
-                                "oldPath": old_rel,
-                                "oldSummary": old_summary,
-                                "newSummary": new_summary,
-                                "oldSizeBytes": old_size,
-                                "newSizeBytes": new_size,
-                                "sourceName": source_name,
-                                "reason": f"高频只到 {new_cut / 1000.0:.1f} kHz，像是有损转的（可开“不核对音质”跳过）",
-                                "settled": True,
-                            }
-                    elif target in ("hires", "master") and int(new_facts.get("sampleRate") or 0) > 48_000:
-                        if new_cut < 22500.0:
-                            return {
-                                "status": "skipped",
-                                "stage": "",
-                                "oldPath": old_rel,
-                                "oldSummary": old_summary,
-                                "newSummary": new_summary,
-                                "oldSizeBytes": old_size,
-                                "newSizeBytes": new_size,
-                                "sourceName": source_name,
-                                "reason": f"高频只到 {new_cut / 1000.0:.1f} kHz，像是升频文件（可开“不核对音质”跳过）",
-                                "settled": True,
-                            }
+            downloaded_path, new_facts, source_name, achieved_target = accepted
 
             if self._cancel_event.is_set():
                 return {"status": "cancelled", "stage": "", "oldPath": old_rel, "oldSummary": old_summary, "oldSizeBytes": old_size, "reason": "已停止", "settled": False}
@@ -938,6 +915,7 @@ class ButlerUpgrader:
                 "oldSizeBytes": old_size,
                 "newSizeBytes": final_size,
                 "sourceName": source_name,
+                "achievedTarget": achieved_target,
                 "settled": True,
             }
         finally:
